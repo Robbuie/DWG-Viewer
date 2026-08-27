@@ -32,14 +32,23 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $v = python -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('src/version.py').read()).group(1))"
-          echo "version=$v" >> $env:GITHUB_OUTPUT
+          # Import the value rather than regexing the file: a regex here
+          # needs escaped double quotes inside a PowerShell string, which
+          # PowerShell mangles before Python ever sees it.
+          # Out-String guards against PowerShell handing back an array
+          # instead of a string if Python ever emits more than one line.
+          $v = (python -c "from src.version import __version__; print(__version__)" | Out-String).Trim()
+          if (-not $v) {
+            Write-Host "::error::Could not read __version__ from src/version.py"
+            exit 1
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           if ($env:GITHUB_REF -like "refs/tags/*") {
-            $tag = $env:GITHUB_REF -replace 'refs/tags/v?',''
+            $tag = $env:GITHUB_REF -replace '^refs/tags/v?', ''
             if ($tag -ne $v) {
-              # A mismatch here means the installer, the About box and the
-              # updater would disagree about what version this build is.
-              Write-Error "Tag v$tag does not match src/version.py ($v). Bump version.py and re-tag."
+              # A mismatch would ship an installer whose filename, About box
+              # and update check all disagree about the version.
+              Write-Host "::error::Tag v$tag does not match src/version.py ($v). Bump version.py and re-tag."
               exit 1
             }
           }

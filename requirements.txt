@@ -1,2 +1,8 @@
 PyQt6>=6.4.0
-ezdxf[draw]>=1.1.0
+# Plain ezdxf, NOT ezdxf[draw]: the [draw] extra pulls in PySide6, and
+# PyInstaller hard-aborts when it finds two Qt bindings in one build.
+# The SVG backend this app uses is in core ezdxf; the extra only adds
+# the matplotlib / PyMuPDF / Qt backends, which are never touched here.
+ezdxf>=1.1.0
+# ezdxf.addons.drawing.frontend imports PIL.Image at module level.
+Pillow>=10.0.0

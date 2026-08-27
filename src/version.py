@@ -14,6 +14,6 @@ __version__ = "1.0.0"
 # GitHub repository that publishes releases. Update these two lines
 # once, after you create the repo.
 GITHUB_OWNER = "Robbuie"
-GITHUB_REPO  = "dwg-viewer"
+GITHUB_REPO  = "DWG-Viewer"
 
 APP_NAME = "DWG Viewer"

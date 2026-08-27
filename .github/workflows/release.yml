@@ -1,0 +1,80 @@
+name: Build and release
+
+# Tag-driven: bump src/version.py, commit, then
+#   git tag v1.0.1 && git push origin v1.0.1
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # required to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Resolve version and check it matches the tag
+        id: ver
+        shell: pwsh
+        run: |
+          $v = python -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('src/version.py').read()).group(1))"
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            $tag = $env:GITHUB_REF -replace 'refs/tags/v?',''
+            if ($tag -ne $v) {
+              # A mismatch here means the installer, the About box and the
+              # updater would disagree about what version this build is.
+              Write-Error "Tag v$tag does not match src/version.py ($v). Bump version.py and re-tag."
+              exit 1
+            }
+          }
+          Write-Host "Building version $v"
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm --clean DWGViewer.spec
+
+      - name: Smoke-test the build
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/DWG Viewer/DWG Viewer.exe")) {
+            Write-Error "Build produced no executable"; exit 1
+          }
+          $size = (Get-ChildItem "dist/DWG Viewer" -Recurse | Measure-Object Length -Sum).Sum / 1MB
+          Write-Host ("Build size: {0:N0} MB" -f $size)
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "installer\DWGViewer.iss"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DWGViewer-Setup-${{ steps.ver.outputs.version }}
+          path: dist_installer/*.exe
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist_installer/*.exe
+          generate_release_notes: true
+          name: DWG Viewer ${{ steps.ver.outputs.version }}

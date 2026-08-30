@@ -272,6 +272,12 @@ SINGLE = {
     0x4D: ("macro-draw-ascii", _ascii_points),
     # 'm': macro-draw with 32-bit relative points
     0x6D: ("macro-draw-32", _points(4)),
+    # 0xAC: set layer by number, the binary form a stream uses for every
+    # layer switch after the declaring (Layer n 'name'). The operand is a
+    # count, not a fixed width. From the DWF Toolkit (opcode.cpp maps
+    # WD_SBBO_SET_LAYER to WT_Layer) rather than from a file: no sample
+    # here has a layer opcode in it.
+    0xAC: ("set-layer", lambda data, i: _count(data, i + 1)[0]),
 }
 
 

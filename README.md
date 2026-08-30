@@ -35,8 +35,9 @@ formats use, so a classic DWF is handled differently:
 * the folder grid shows the plot preview AutoCAD embeds when publishing,
   so tiles appear immediately without decoding anything
 
-Layers come from `(Layer …)` opcodes in the stream, which are decoded
-and applied — but most classic DWFs do not have any. AutoCAD only writes
+Layers come from the stream's layer opcodes — `(Layer 3 'WALLS')` to
+declare one and either `(Layer 3)` or the binary `0xAC` to re-select it
+— which are decoded and applied. But most classic DWFs do not have any. AutoCAD only writes
 them when a sheet is published with layer information included, and both
 of the sample sheets this decoder was built against were published
 without it: 430 MB of opcodes between them and not one layer. When a
@@ -55,7 +56,7 @@ than the raster, filters layers with no re-decode at all.
 |--------|------------------------|
 | `.dxf` / `.dwg` | the CAD layer table, with each layer's colour |
 | `.dwfx` | named Canvas groups — XPS has no layer table |
-| `.dwf` | `(Layer …)` opcodes, when the sheet was published with them |
+| `.dwf` | layer opcodes, when the sheet was published with them |
 
 An empty layer panel always says why it is empty: a DWFx with no named
 groups, a drawing that defines no layers, a classic DWF still decoding,
@@ -101,6 +102,10 @@ missing `libEGL`, not a missing PyQt6).
 
 `test_w2d_layers.py` builds W2D opcode streams by hand to exercise the
 classic-DWF layer path, because no sample drawing here has layers in it.
+Its layer-opcode layouts come from the DWF Toolkit source rather than
+from a real stream, which is the one place in this decoder that is true
+— everything else was recovered from files. That makes these tests the
+only thing standing behind the layer path until a layered DWF turns up.
 Its decoding tests need only the standard library; the rendering ones
 need numpy and Pillow and skip without them.
 `test_converter_dwf.py` goes the rest of the way: it assembles a real

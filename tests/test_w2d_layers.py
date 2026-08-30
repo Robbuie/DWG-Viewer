@@ -54,6 +54,22 @@ def layer(number: int, name: str | None = None) -> bytes:
     return f"(Layer {number} '{name}')".encode()
 
 
+def layer_unicode(number: int, name: str) -> bytes:
+    """The UTF-16 string form a non-ASCII layer name gets."""
+    body = name.encode("utf-16-le")
+    return (f"(Layer {number} ".encode() + b"{"
+            + len(name).to_bytes(4, "little") + body + b"})")
+
+
+def layer_binary(number: int) -> bytes:
+    """0xAC + a count: how a binary-mode stream re-selects a layer once
+    it has been declared. This is the form that matters — the toolkit
+    writes it for every switch after the first."""
+    if 0 < number < 256:
+        return b"\xac" + bytes([number])
+    return b"\xac" + b"\x00" + (number - 256).to_bytes(2, "little")
+
+
 def origin(x: int, y: int) -> bytes:
     return b"O" + struct.pack("<ii", x, y)
 
@@ -142,6 +158,62 @@ def test_ascii_tokens_are_tallied():
     _, decoder = decode(data)
     assert decoder.ascii_tokens["Layer"] == 2
     assert decoder.ascii_tokens["View"] == 1
+
+
+def test_binary_layer_reselection_is_decoded():
+    """0xAC is what a real layered DWF uses for every layer switch after
+    the declaration. Before this was handled the decoder raised
+    UnsupportedOpcode and lost the whole sheet at the first switch."""
+    data = stream(view(0, 0, 1000, 1000),
+                  layer(1, "WALLS"), origin(0, 0), line(0, 0, 100, 0),
+                  layer(2, "TEXT"), line(0, 100, 100, 0),
+                  layer_binary(1), line(0, 100, 50, 0),
+                  layer_binary(2), line(0, 100, 50, 0))
+    collector, decoder = decode(data)
+    assert list(collector.seg_layer) == [1, 2, 1, 2]
+    # The names came from the declarations; the binary form carries none.
+    assert collector.layers() == ["WALLS", "TEXT"]
+    assert decoder.layer == 2
+
+
+def test_a_binary_layer_number_above_255_uses_the_wide_count():
+    data = stream(view(0, 0, 1000, 1000),
+                  layer(300, "WIDE"), origin(0, 0), line(0, 0, 100, 0),
+                  layer(1, "NARROW"), line(0, 100, 100, 0),
+                  layer_binary(300), line(0, 100, 50, 0))
+    collector, _ = decode(data)
+    assert list(collector.seg_layer) == [300, 1, 300]
+
+
+def test_a_binary_reselection_of_an_undeclared_layer_gets_a_number():
+    data = stream(view(0, 0, 1000, 1000),
+                  layer_binary(9), origin(0, 0), line(0, 0, 100, 0))
+    collector, _ = decode(data)
+    assert collector.layers() == ["Layer 9"]
+    assert list(collector.seg_layer) == [9]
+
+
+def test_a_utf16_layer_name_is_read_and_does_not_derail_the_stream():
+    """UTF-16 bytes contain 0x28 and 0x29 — '(' and ')' — so a name in
+    that form would close the opcode early if it were stepped over byte
+    by byte, and every coordinate after it would be garbage."""
+    data = stream(view(0, 0, 1000, 1000),
+                  layer_unicode(1, "MUR(S)"), origin(0, 0), line(0, 0, 100, 0),
+                  layer(2, "TEXT"), line(0, 100, 100, 0))
+    collector, _ = decode(data)
+    assert collector.layers() == ["MUR(S)", "TEXT"]
+    assert list(collector.seg_layer) == [1, 2]
+
+
+def test_a_declaration_can_be_reselected_by_either_form():
+    data = stream(view(0, 0, 1000, 1000),
+                  layer(5, "GRID"), origin(0, 0), line(0, 0, 100, 0),
+                  layer(6, "TEXT"), line(0, 100, 100, 0),
+                  layer(5), line(0, 100, 10, 0),
+                  layer_binary(5), line(0, 100, 10, 0))
+    collector, _ = decode(data)
+    assert list(collector.seg_layer) == [5, 6, 5, 5]
+    assert collector.layers() == ["GRID", "TEXT"]
 
 
 # ── Rendering ────────────────────────────────────────────────────────

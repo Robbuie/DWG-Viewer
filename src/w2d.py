@@ -18,7 +18,6 @@ of those would cost more memory than the raster we are building.
 """
 from __future__ import annotations
 
-import re
 import struct
 from array import array
 from typing import Protocol
@@ -55,11 +54,19 @@ class _LazyACI:
 ACI = _LazyACI()
 
 
-# (Layer 3 'WALLS') declares a layer and makes it current; every later
-# reference to the same layer is the bare number, so the name is carried
-# forward. A sheet published without layer information has none of these
-# at all, which is the usual case for AutoCAD's ePlot output.
-_LAYER_RE = re.compile(rb"\(Layer\s+(-?\d+)\s*(?:'((?:[^'\\]|\\.)*)')?", re.I)
+# Layers come in two forms, and a file uses both:
+#
+#   (Layer 3 'WALLS')   declares a layer and makes it current
+#   (Layer 3)           re-selects it by number, ASCII
+#   0xAC <count>        re-selects it by number, binary
+#
+# The name is written once, with the declaration, so it has to be
+# carried forward. Unlike every other opcode here, these two were taken
+# from the DWF Toolkit source (whiptk/layer.cpp and opcode.cpp) rather
+# than recovered from a real stream: neither sample sheet has a single
+# layer opcode in it, because AutoCAD writes them only when a sheet is
+# published with layer information included.
+_LAYER_START = b"(Layer"
 
 
 def layer_label(index: int, name: str) -> str:
@@ -442,6 +449,19 @@ class W2dDecoder:
                 i += 1
                 reading = False
                 continue
+            if c == 0x7B:                       # '{' UTF-16 string
+                # A non-ASCII name arrives as UTF-16, whose bytes freely
+                # include 0x28 and 0x29 — ')' is 0x29 0x00 — so stepping
+                # over it byte by byte would close the opcode early. The
+                # jump is only taken when it lands on the '}' that must
+                # terminate the string, so a stray '{' in ordinary text
+                # still falls through to the plain path below.
+                chars = int.from_bytes(data[i + 1:i + 5], "little")
+                skip = i + 5 + 2 * chars
+                if 0 < skip < n and data[skip:skip + 1] == b"}":
+                    i = skip + 1
+                    reading = False
+                    continue
             if c == 0x28:
                 depth += 1
             elif c == 0x29:
@@ -456,31 +476,32 @@ class W2dDecoder:
             i += 1
         raise W2dError("unterminated ASCII opcode")
 
-    def _layer_opcode(self, body: bytes, sink) -> None:
+    def _layer_opcode(self, start: int, end: int, sink) -> None:
         """(Layer <number> ['name']) — declares a layer and makes it
-        current. The name comes with the first mention only; later
-        references are the bare number, so names are carried forward.
+        current, or re-selects one by number alone.
 
-        A name given in the Unicode '{...}' string form is not read back
-        here; that layer keeps its numeric label rather than being
-        dropped.
+        The name is read with the ordinary string reader, so both shapes
+        the toolkit can write are accepted: a quoted 'name' and the
+        UTF-16 '{...}' form a non-ASCII layer name gets.
         """
-        m = _LAYER_RE.match(body)
-        if m is None:
-            return
-        index = int(m.group(1))
-        raw = m.group(2)
-        if raw is not None:
-            out = bytearray()
-            k = 0
-            while k < len(raw):
-                if raw[k] == 0x5C and k + 1 < len(raw):
-                    k += 1
-                out.append(raw[k])
-                k += 1
-            got = out.decode("latin-1").strip()
-            if got:
-                self.layer_names[index] = got
+        data = self.data
+        k = start + len(_LAYER_START)
+        try:
+            k, index = self._ascii_int(k)
+        except W2dError:
+            return                      # not a layer opcode after all
+        while k < end and data[k] in WS:
+            k += 1
+        if k < end and data[k] in (0x27, 0x7B):
+            try:
+                _, name = self._string(k)
+            except (W2dError, IndexError):
+                name = ""
+            if name.strip():
+                self.layer_names[index] = name.strip()
+        self._select_layer(index, sink)
+
+    def _select_layer(self, index: int, sink) -> None:
         self.layer = index
         setter = getattr(sink, "set_layer", None)
         if setter is not None:
@@ -541,7 +562,7 @@ class W2dDecoder:
                 j, token = self._ascii_opcode(i)
                 self.ascii_tokens[token] = self.ascii_tokens.get(token, 0) + 1
                 if token.lower() == "layer":
-                    self._layer_opcode(data[i:j], sink)
+                    self._layer_opcode(i, j, sink)
                 i = j
                 continue
 
@@ -643,6 +664,13 @@ class W2dDecoder:
 
             if b == 0x06:                       # font
                 i = self._font(i + 1)
+                continue
+
+            if b == 0xAC:                       # set layer, binary
+                # A count, not a fixed width: the same one-byte /
+                # zero-then-16-bit encoding the point-set opcodes use.
+                i, index = self._count(i + 1)
+                self._select_layer(index, sink)
                 continue
 
             if b == 0x4E:                       # 'N' object node, 32-bit id

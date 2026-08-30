@@ -154,6 +154,16 @@ class DrawingCanvas(QGraphicsView):
         self._draft_item: QGraphicsItem | None = None
         self._draft_points: list[QPointF] = []
 
+        # Text search
+        self._text_index = None
+        self._text_query = ""
+        self._text_matches: list = []
+        self._text_pos = -1
+        self._text_marker = None
+
+        # Real paper size of the sheet, when the format records one.
+        self._paper_inches: tuple[float, float] | None = None
+
         # Snapshot to clipboard
         self._snap_mode = False
         self._snap_origin: QPointF | None = None
@@ -404,6 +414,10 @@ class DrawingCanvas(QGraphicsView):
         self._svg_viewbox = None
         self._nav.set_drawing(None, QRectF())
         self._nav.hide()
+        self._paper_inches = None
+        self._text_marker = None
+        self._text_matches = []
+        self._text_pos = -1
         self._mk_items.clear()
         self._mk_origin.clear()
         self._draft_item = None
@@ -658,6 +672,135 @@ class DrawingCanvas(QGraphicsView):
             self.pageNavigateRequested.emit(-1)
         else:
             super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------ #
+    #  Text search
+    # ------------------------------------------------------------------ #
+
+    def set_text_index(self, index) -> None:
+        self._text_index = index
+        self._text_query = ""
+        self._text_matches = []
+        self._text_pos = -1
+        self._clear_text_marker()
+
+    def text_index_size(self) -> int:
+        return len(self._text_index) if self._text_index else 0
+
+    def _clear_text_marker(self) -> None:
+        if self._text_marker is not None:
+            try:
+                if self._text_marker.scene() is self._scene:
+                    self._scene.removeItem(self._text_marker)
+            except RuntimeError:
+                pass
+        self._text_marker = None
+
+    def clear_text_search(self) -> None:
+        self._text_query = ""
+        self._text_matches = []
+        self._text_pos = -1
+        self._clear_text_marker()
+
+    def find_text(self, query: str, forward: bool = True) -> tuple[int, int]:
+        """Step to the next match. Returns (position, total), 1-based."""
+        query = (query or "").strip()
+        if query != self._text_query:
+            self._text_query = query
+            self._text_matches = (self._text_index.search(query)
+                                  if self._text_index else [])
+            self._text_pos = -1
+        total = len(self._text_matches)
+        if not total:
+            self._clear_text_marker()
+            return 0, 0
+        step = 1 if forward else -1
+        self._text_pos = (self._text_pos + step) % total
+        self._show_hit(self._text_matches[self._text_pos])
+        return self._text_pos + 1, total
+
+    def _hit_rect(self, hit) -> QRectF:
+        content = self._content_rect()
+        return QRectF(content.left() + hit.x * content.width(),
+                      content.top() + hit.y * content.height(),
+                      max(hit.w, 1e-4) * content.width(),
+                      max(hit.h, 1e-4) * content.height())
+
+    def _show_hit(self, hit) -> None:
+        content = self._content_rect()
+        if content.isEmpty():
+            return
+        rect = self._hit_rect(hit)
+
+        # Keep the zoom the user chose when the hit would already be a
+        # readable size; only reframe when it would be a speck or fill
+        # the screen.
+        on_screen = rect.width() * self.transform().m11()
+        if 24 <= on_screen <= 500:
+            self.centerOn(rect.center())
+        else:
+            pad = max(rect.width(), rect.height()) * 1.6 + content.width() * 0.01
+            self.fitInView(rect.adjusted(-pad, -pad, pad, pad),
+                           Qt.AspectRatioMode.KeepAspectRatio)
+            zoom = self.transform().m11()
+            if zoom > _MAX_ZOOM or zoom < _MIN_ZOOM:
+                clamped = min(_MAX_ZOOM, max(_MIN_ZOOM, zoom))
+                self.scale(clamped / zoom, clamped / zoom)
+                zoom = clamped
+            self._current_zoom = zoom
+            self._update_sampling()
+
+        self._clear_text_marker()
+        marker = self._scene.addRect(
+            rect.adjusted(-rect.height() * 0.15, -rect.height() * 0.15,
+                          rect.height() * 0.15, rect.height() * 0.15),
+            QPen(QColor("#ffb454"), 0), QColor(255, 200, 60, 70))
+        marker.setZValue(30)
+        self._text_marker = marker
+
+        self._schedule_detail()
+        self._update_navigator_view()
+
+    # ------------------------------------------------------------------ #
+    #  Geometry and printing
+    # ------------------------------------------------------------------ #
+
+    def content_rect(self) -> QRectF:
+        """The drawing's own rectangle in scene coordinates."""
+        return self._content_rect()
+
+    def visible_scene_rect(self) -> QRectF:
+        return self.mapToScene(self.viewport().rect()).boundingRect()
+
+    def paper_inches(self) -> tuple[float, float] | None:
+        return self._paper_inches
+
+    def set_paper_inches(self, size: tuple[float, float] | None) -> None:
+        """Told by the loader when the format records a real page size."""
+        if size and size[0] > 0 and size[1] > 0:
+            self._paper_inches = (float(size[0]), float(size[1]))
+        else:
+            self._paper_inches = None
+
+    def render_scene(self, painter: QPainter, target: QRectF, source: QRectF,
+                     include_markup: bool = True) -> None:
+        """Draw part of the scene onto an arbitrary painter.
+
+        Used by printing, which needs the drawing on a page rather than
+        in an image, and by the snapshot code through render_region.
+        """
+        hidden = []
+        if not include_markup:
+            for item in self._mk_items.values():
+                if item.isVisible():
+                    item.setVisible(False)
+                    hidden.append(item)
+        try:
+            self._scene.render(painter, target, source,
+                               Qt.AspectRatioMode.IgnoreAspectRatio)
+        finally:
+            for item in hidden:
+                item.setVisible(True)
 
     # ------------------------------------------------------------------ #
     #  Markup (redlines)

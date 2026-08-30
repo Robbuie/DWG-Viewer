@@ -238,6 +238,7 @@ class SheetGeometry:
         self.inches_per_unit = inches_per_unit
         self.palette = collector.palette
         self.tri = collector.tri
+        self.texts = list(getattr(collector, "texts", ()))
 
         self.seg = np.frombuffer(collector.seg, dtype=np.int32).reshape(-1, 4)
         self.seg_col = np.frombuffer(collector.seg_col, dtype=np.uint16)

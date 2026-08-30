@@ -468,6 +468,48 @@ class DWGConverter:
         except Exception:
             return None
 
+    def build_text_index(self, svg: str | None = None):
+        """Searchable text for the current sheet.
+
+        The SVG is passed in rather than re-rendered because the loader
+        has just produced it; DWFx keeps its strings as real <text>
+        there, DXF and DWG do not (the backend strokes them), and classic
+        DWF only has text once the geometry pass has run.
+        """
+        from src import textsearch
+        if svg and "<text" in svg:
+            return textsearch.from_svg(svg)
+        if self._doc is not None:
+            return textsearch.from_dxf(self._doc)
+        if self._geometry is not None:
+            return textsearch.from_classic_geometry(self._geometry)
+        return textsearch.TextIndex()
+
+    def paper_size_inches(self) -> tuple[float, float] | None:
+        """The sheet's real paper size, when the format records one.
+
+        DWFx is an XPS package, so its FixedPage carries a true page size
+        in 1/96 inch; classic DWF stores inches per drawing unit in its
+        graphics stream. DXF and DWG are model space with no plot layout
+        attached, so there is no honest answer for them — callers get
+        None and offer fit-to-page instead of pretending to a scale.
+        """
+        if self._dwfx is not None:
+            try:
+                sheet = self._dwfx.sheets[self._sheet]
+                w = float(sheet["width"]) / 96.0
+                h = float(sheet["height"]) / 96.0
+                return (w, h) if w > 0 and h > 0 else None
+            except Exception:
+                return None
+        if self._classic:
+            box = self._inches_box(0, 0)
+            if box is None:
+                return None
+            w, h = abs(box[2]), abs(box[3])
+            return (w, h) if w > 0 and h > 0 else None
+        return None
+
     @property
     def sheet_count(self) -> int:
         return self._dwfx.sheet_count if self._dwfx is not None else 1

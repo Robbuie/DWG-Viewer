@@ -1,8 +1,8 @@
 # DWG Viewer
 
 A fast drawing viewer for Windows: folder thumbnails, pan/zoom, layer
-toggles, point-to-point measurement, redline markup, and snapshots to
-the clipboard.
+toggles, point-to-point measurement, redline markup, text search,
+printing to scale, and snapshots to the clipboard.
 
 ## Supported formats
 
@@ -58,14 +58,17 @@ python tests\test_dwfx.py
 python tests\test_converter_dwfx.py
 python tests\test_navigator.py
 python tests\test_markup.py
+python tests\test_printing.py
 ```
 
 The first two run on the standard library alone (they stub ezdxf if it is
 missing) and build their own synthetic DWFx packages, so no sample
-drawings are needed. `test_navigator.py` and `test_markup.py`
-drive the navigator, the panel toggles, the redline tools and the
-snapshot capture through real Qt events on the offscreen platform, and
-skip themselves if PyQt6 is not installed.
+drawings are needed. `test_navigator.py`, `test_markup.py` and
+`test_printing.py` drive the navigator, the panel toggles, the redline
+tools, the snapshot capture, the page-tiling maths and on-sheet search
+through real Qt events on the offscreen platform — printing goes to a
+PDF, so no printer is needed — and they skip themselves if PyQt6 is not
+installed.
 
 ## Diagnostics
 
@@ -85,6 +88,9 @@ arguments.
 | `P` | Pan mode |
 | `R` | Re-render after toggling layers |
 | `N` | Show / hide the navigator |
+| `Ctrl`+`P` | Print — to scale or fitted |
+| `Ctrl`+`F` | Find text on the sheet |
+| `F3` | Find the next match |
 | `S` | Snapshot — drag a region to the clipboard |
 | `Ctrl`+`Shift`+`C` | Copy the whole visible drawing |
 | `Ctrl`+`Shift`+`S` | Save the visible drawing as a PNG |
@@ -113,6 +119,46 @@ entirely — the choice sticks for the next drawing.
 
 Because it floats over the canvas rather than living in a panel, it is
 still there with both side panels hidden.
+
+## Printing
+
+`Ctrl`+`P` asks what to print and at what size, then opens the normal
+print preview, where the printer and paper are chosen.
+
+**Scale is real or it is not offered.** DWFx carries a true page size
+(XPS units are 1/96 inch) and classic DWF records inches per drawing
+unit, so for those "Actual size (1:1)" really is 1:1 and half size
+really is half. DXF and DWG open here as model space with no plot
+layout, so there is no honest inches-per-unit to quote — those get
+fit-to-page, and the dialog says why rather than offering a scale that
+would be a guess.
+
+A D-size sheet at 1:1 does not fit on letter paper, so it is **tiled**
+across as many pages as it needs (a 34x22 sheet becomes 4 across by 3
+down) rather than being silently shrunk. Turning tiling off prints the
+middle of the drawing at the requested scale instead. Either way you can
+print the whole sheet or only what is on screen, with or without markup.
+
+## Text search
+
+`Ctrl`+`F` opens a find bar along the bottom; `F3` steps to the next
+match. Matches are walked in reading order — top to bottom, then left to
+right — and each one is centred and highlighted, keeping your zoom if
+the text is already a readable size and reframing if it would be a
+speck.
+
+Where the text comes from depends on the format:
+
+* **DWFx** keeps real text in the sheet, so every label is searchable.
+* **DXF and DWG** have their text converted to outlines by the renderer,
+  so the strings are read from the document instead and placed through
+  the same fit-and-centre transform the renderer uses.
+* **Classic DWF** draws most of its lettering as stroked line work with
+  no string attached, so only genuine text opcodes can be found. Those
+  are collected during the geometry pass that already runs for sharp
+  zoom, so searching costs nothing extra — but expect a sheet to have
+  fewer searchable labels than it has visible words. The find bar says
+  how many it has.
 
 ## Markup
 

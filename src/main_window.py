@@ -10,7 +10,7 @@ from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QColor, QActionGr
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QLabel,
     QToolBar, QWidget, QProgressBar, QMessageBox,
-    QFileDialog, QSizePolicy, QComboBox,
+    QFileDialog, QSizePolicy, QComboBox, QLineEdit,
 )
 
 from src.file_browser import FileBrowser
@@ -20,6 +20,7 @@ from src.converter import DWGConverter, DrawingError
 from src.version import __version__, APP_NAME
 from src.update_ui import UpdateChecker
 from src import markup as mk
+from src import printing
 
 
 # ------------------------------------------------------------------ #
@@ -46,9 +47,10 @@ class _GeometryWorker(QThread):
 
 
 class _LoadSignals(QObject):
-    # converter, layers, svg, png bytes, extents — a drawing arrives as
-    # one or the other: vector formats as SVG, classic DWF as a raster.
-    finished = pyqtSignal(object, list, str, object, object)
+    # converter, layers, svg, png bytes, extents, text index — a drawing
+    # arrives as one or the other: vector formats as SVG, classic DWF as
+    # a raster.
+    finished = pyqtSignal(object, list, str, object, object, object)
     error = pyqtSignal(str)
 
 
@@ -66,10 +68,13 @@ class _LoadWorker(QThread):
             layers = conv.get_layers()
             if conv.is_raster:
                 png, extents = conv.render_raster()
-                self.signals.finished.emit(conv, layers, "", png, extents)
+                # Classic DWF has no text until the geometry pass runs,
+                # which happens after the drawing is already on screen.
+                self.signals.finished.emit(conv, layers, "", png, extents, None)
             else:
                 svg = conv.render_svg()
-                self.signals.finished.emit(conv, layers, svg, None, None)
+                index = conv.build_text_index(svg)
+                self.signals.finished.emit(conv, layers, svg, None, None, index)
         except DrawingError as exc:
             self.signals.error.emit(str(exc))
         except Exception as exc:
@@ -105,6 +110,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_toolbar()
         self._build_markup_toolbar()
+        self._build_find_bar()
         self._build_statusbar()
 
         # Quiet daily check: says nothing unless there is something to say.
@@ -175,6 +181,18 @@ class MainWindow(QMainWindow):
         act_open.setShortcut(QKeySequence("Ctrl+O"))
         act_open.triggered.connect(self._browse_folder)
         tb.addAction(act_open)
+
+        act_print = QAction("🖨  Print", self)
+        act_print.setToolTip("Print the drawing, to scale or fitted (Ctrl+P)")
+        act_print.setShortcut(QKeySequence("Ctrl+P"))
+        act_print.triggered.connect(self._print)
+        tb.addAction(act_print)
+
+        act_find = QAction("🔍  Find", self)
+        act_find.setToolTip("Find text on the sheet (Ctrl+F)")
+        act_find.setShortcut(QKeySequence("Ctrl+F"))
+        act_find.triggered.connect(self._show_find)
+        tb.addAction(act_find)
 
         tb.addSeparator()
 
@@ -311,6 +329,129 @@ class MainWindow(QMainWindow):
         act_about = QAction("About", self)
         act_about.triggered.connect(self._about)
         tb.addAction(act_about)
+
+    # ------------------------------------------------------------------ #
+    #  Find bar
+    # ------------------------------------------------------------------ #
+
+    def _build_find_bar(self):
+        """A strip at the bottom, hidden until asked for.
+
+        At the bottom rather than in the toolbar because it appears and
+        disappears; a control that shuffles the toolbar every time it is
+        used moves everything else out from under the cursor.
+        """
+        bar = QToolBar("Find")
+        bar.setMovable(False)
+        bar.setStyleSheet(
+            "QToolBar { background: #262626; border-top: 1px solid #444;"
+            " spacing: 6px; padding: 2px 6px; }"
+            "QToolButton { color: #ccc; padding: 3px 7px; border-radius: 3px; }"
+            "QToolButton:hover { background: #3a3a3a; }")
+        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, bar)
+
+        label = QLabel("Find on sheet:")
+        label.setStyleSheet("color:#888; font-size:11px;")
+        bar.addWidget(label)
+
+        self._find_edit = QLineEdit()
+        self._find_edit.setPlaceholderText("Tag, label or note…")
+        self._find_edit.setMaximumWidth(280)
+        self._find_edit.setStyleSheet(
+            "QLineEdit { background:#2a2a2a; border:1px solid #444;"
+            " border-radius:3px; padding:3px 6px; color:#ddd; }")
+        self._find_edit.returnPressed.connect(lambda: self._find_step(True))
+        self._find_edit.textChanged.connect(self._on_find_text_changed)
+        bar.addWidget(self._find_edit)
+
+        act_prev = QAction("\u25c0  Previous", self)
+        act_prev.triggered.connect(lambda: self._find_step(False))
+        bar.addAction(act_prev)
+
+        act_next = QAction("\u25b6  Next", self)
+        act_next.triggered.connect(lambda: self._find_step(True))
+        bar.addAction(act_next)
+
+        self._find_label = QLabel("")
+        self._find_label.setStyleSheet("color:#888; font-size:11px;")
+        bar.addWidget(self._find_label)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        bar.addWidget(spacer)
+
+        act_close = QAction("\u2715", self)
+        act_close.setToolTip("Close the find bar (Esc)")
+        act_close.triggered.connect(self._hide_find)
+        bar.addAction(act_close)
+
+        self._find_bar = bar
+        bar.hide()
+
+        # Scoped to the find field: a window-wide Escape here would
+        # steal the key from the canvas, where it cancels a half-drawn
+        # markup or backs out of snapshot mode.
+        act_esc = QAction("Close find", self._find_edit)
+        act_esc.setShortcut(QKeySequence("Esc"))
+        act_esc.setShortcutContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        act_esc.triggered.connect(self._hide_find)
+        self._find_edit.addAction(act_esc)
+
+        act_next_key = QAction("Find next", self)
+        act_next_key.setShortcut(QKeySequence("F3"))
+        act_next_key.triggered.connect(lambda: self._find_step(True))
+        self.addAction(act_next_key)
+
+    def _show_find(self) -> None:
+        self._find_bar.show()
+        self._find_edit.setFocus()
+        self._find_edit.selectAll()
+        self._update_find_status()
+
+    def _hide_find(self) -> None:
+        self._find_bar.hide()
+        self._canvas.clear_text_search()
+        self._canvas.setFocus()
+
+    def _on_find_text_changed(self, _text: str) -> None:
+        # Typing restarts the walk; nothing moves until Enter or Next, so
+        # the drawing does not lurch around under a half-typed tag.
+        self._canvas.clear_text_search()
+        self._update_find_status()
+
+    def _find_step(self, forward: bool) -> None:
+        query = self._find_edit.text().strip()
+        if not query:
+            self._update_find_status()
+            return
+        position, total = self._canvas.find_text(query, forward)
+        if not total:
+            self._find_label.setText("No match")
+            available = self._canvas.text_index_size()
+            if not available:
+                self.statusBar().showMessage(
+                    "This sheet has no searchable text — its lettering is "
+                    "drawn as line work.", 5000)
+        else:
+            self._find_label.setText(f"{position} of {total}")
+
+    def _update_find_status(self) -> None:
+        if not hasattr(self, "_find_label"):
+            return
+        available = self._canvas.text_index_size()
+        if not self._find_edit.text().strip():
+            self._find_label.setText(
+                f"{available} labels on this sheet" if available
+                else "No searchable text")
+        self._find_edit.setEnabled(True)
+
+    # ------------------------------------------------------------------ #
+    #  Printing
+    # ------------------------------------------------------------------ #
+
+    def _print(self) -> None:
+        printing.print_drawing(self, self._canvas)
 
     # ------------------------------------------------------------------ #
     #  Markup toolbar
@@ -721,7 +862,7 @@ class MainWindow(QMainWindow):
         return f"Loading: {name} …"
 
     def _on_load_finished(self, conv: DWGConverter, layers: list, svg: str,
-                          png=None, extents=None):
+                          png=None, extents=None, text_index=None):
         self._current_conv = conv
         self._populate_sheets(conv)
         self._layers.populate(layers)
@@ -739,6 +880,9 @@ class MainWindow(QMainWindow):
         else:
             self._canvas.load_svg(svg)
         self._attach_markup()
+        self._canvas.set_paper_inches(conv.paper_size_inches())
+        self._canvas.set_text_index(text_index)
+        self._update_find_status()
         name = conv.filepath.name
         detail = "rasterised" if png else f"{len(layers)} layers"
         self._file_label.setText(f"{name}  ({detail})")
@@ -762,9 +906,13 @@ class MainWindow(QMainWindow):
         if conv is not self._current_conv:
             return          # a different drawing was opened meanwhile
         self._canvas.set_detail_provider(conv.render_detail_png)
+        self._canvas.set_text_index(conv.build_text_index())
+        self._update_find_status()
+        found = self._canvas.text_index_size()
+        extra = f" {found} searchable labels." if found else ""
         self.statusBar().showMessage(
             "Sharp zoom ready — the drawing is now redrawn at full detail "
-            "as you zoom in.", 5000)
+            "as you zoom in." + extra, 5000)
 
     def _populate_sheets(self, conv: DWGConverter | None):
         names = conv.sheet_names() if conv is not None else []
@@ -822,6 +970,11 @@ class MainWindow(QMainWindow):
         w = _RenderWorker(self._current_conv)
         w.done.connect(lambda svg: (self._canvas.load_svg(svg),
                                     self._attach_markup(),
+                                    self._canvas.set_paper_inches(
+                                        self._current_conv.paper_size_inches()),
+                                    self._canvas.set_text_index(
+                                        self._current_conv.build_text_index(svg)),
+                                    self._update_find_status(),
                                     self._progress.setVisible(False)))
         w.err.connect(lambda msg: (self._progress.setVisible(False),
                                    self.statusBar().showMessage(f"Render error: {msg}", 4000)))

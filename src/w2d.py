@@ -97,6 +97,11 @@ class GeometryCollector:
         self.arc_ang = array("f")      # start, end per arc
         self.arc_col = array("H")
         self.tri: list[tuple[list, int]] = []   # rare; kept as-is
+        # Text opcodes, kept for search. Most lettering on a published
+        # ePlot sheet arrives as stroked geometry rather than text, so
+        # this is usually a short list — but a title block or a tag that
+        # did survive as text is exactly what someone searches for.
+        self.texts: list[tuple[int, int, str]] = []
         self.palette: list[tuple[int, int, int]] = [(0, 0, 0)]
         self._pal_index = {(0, 0, 0): 0}
         self._colour = 0
@@ -174,7 +179,11 @@ class GeometryCollector:
         self.arc_col.append(self._colour)
 
     def text(self, x, y, s):
-        pass       # sheet lettering is already stroked geometry
+        # Drawn lettering is already stroked geometry, so this adds
+        # nothing to the picture — but the string is worth keeping so it
+        # can be searched for.
+        if s and s.strip() and len(self.texts) < 200_000:
+            self.texts.append((x, y, s))
 
     # -- summary -------------------------------------------------------
 

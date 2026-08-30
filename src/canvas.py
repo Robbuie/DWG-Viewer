@@ -8,16 +8,18 @@ from __future__ import annotations
 import math
 import re
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal, QTimer, QThread, QObject
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSize, pyqtSignal, QTimer, QThread, QObject
 from PyQt6.QtGui import (
     QWheelEvent, QMouseEvent, QKeyEvent, QPainter,
-    QPen, QColor, QCursor, QTransform, QPixmap, QImageReader,
+    QPen, QColor, QCursor, QTransform, QPixmap, QImage, QImageReader,
 )
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsLineItem,
                              QGraphicsEllipseItem, QGraphicsPixmapItem)
 from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
+
+from src.navigator import NavigatorOverlay
 
 
 class _DetailWorker(QThread):
@@ -67,6 +69,7 @@ class DrawingCanvas(QGraphicsView):
     coordChanged = pyqtSignal(float, float)
     measurementDone = pyqtSignal(float, float, float, float, float)
     pageNavigateRequested = pyqtSignal(int)   # +1 = next file, -1 = previous file
+    navigatorVisibilityChanged = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -116,6 +119,21 @@ class DrawingCanvas(QGraphicsView):
         self._detail_timer.setInterval(220)     # let a burst of zooming settle
         self._detail_timer.timeout.connect(self._request_detail)
 
+        # Overview map. It is a child of the view rather than of the
+        # viewport, which puts it above the drawing and gives it its own
+        # mouse events instead of the pan handler's.
+        self._nav = NavigatorOverlay(self)
+        self._nav.centerRequested.connect(self._nav_center_on)
+        self._nav.rectRequested.connect(self._nav_fit_rect)
+        self._nav.zoomRequested.connect(self._nav_zoom)
+        self._nav.closeRequested.connect(
+            lambda: self.set_navigator_visible(False))
+        self._nav.hide()
+        self._nav_wanted = True          # user preference, independent of
+                                         # whether a drawing is loaded
+        self.horizontalScrollBar().valueChanged.connect(self._update_navigator_view)
+        self.verticalScrollBar().valueChanged.connect(self._update_navigator_view)
+
     # ------------------------------------------------------------------ #
     #  Public API
     # ------------------------------------------------------------------ #
@@ -150,6 +168,7 @@ class DrawingCanvas(QGraphicsView):
 
         self._scene.setSceneRect(item.boundingRect())
         self.fit_to_view()
+        self._refresh_navigator()
 
     @staticmethod
     def _load_downscaled(png_data: bytes) -> QPixmap | None:
@@ -312,6 +331,7 @@ class DrawingCanvas(QGraphicsView):
 
         self._scene.setSceneRect(item.boundingRect())
         self.fit_to_view()
+        self._refresh_navigator()
         return True
 
     def fit_to_view(self) -> None:
@@ -328,6 +348,7 @@ class DrawingCanvas(QGraphicsView):
         self._current_zoom = self.transform().m11()
         self._update_sampling()
         self._schedule_detail()
+        self._update_navigator_view()
 
     def set_pan_mode(self, enabled: bool) -> None:
         """Called by the toolbar Pan button to enable/disable left-click panning."""
@@ -354,14 +375,140 @@ class DrawingCanvas(QGraphicsView):
         self._svg_item = None
         self._svg_renderer = None
         self._svg_viewbox = None
+        self._nav.set_drawing(None, QRectF())
+        self._nav.hide()
         self._measure_point1 = None
         self._measure_line = None
         self._measure_dot1 = None
         self._measure_dot2 = None
 
     # ------------------------------------------------------------------ #
+    #  Overview map
+    # ------------------------------------------------------------------ #
+
+    def set_navigator_visible(self, visible: bool) -> None:
+        """Show or hide the overview map (remembered across drawings)."""
+        self._nav_wanted = bool(visible)
+        if visible and self._nav.has_drawing():
+            self._nav.show()
+            self._nav.raise_()
+            self._nav.anchor_to_parent()
+            self._update_navigator_view()
+        else:
+            self._nav.hide()
+        self.navigatorVisibilityChanged.emit(self._nav_wanted)
+
+    def navigator_visible(self) -> bool:
+        return self._nav.isVisible()
+
+    def _content_rect(self) -> QRectF:
+        if self._svg_item is None:
+            return QRectF()
+        return self._svg_item.sceneBoundingRect()
+
+    def _build_navigator_thumb(self) -> QPixmap | None:
+        """A miniature of the whole sheet, drawn once per load.
+
+        Raster drawings are simply scaled down; SVG is re-rendered small,
+        which is both sharper and cheaper than rasterising it full size
+        and throwing the pixels away.
+        """
+        max_w, max_h = NavigatorOverlay.thumb_bounds()
+        item = self._svg_item
+        if item is None:
+            return None
+
+        if isinstance(item, QGraphicsPixmapItem):
+            pix = item.pixmap()
+            if pix.isNull():
+                return None
+            return pix.scaled(max_w, max_h,
+                              Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+
+        renderer = self._svg_renderer
+        if renderer is None or not renderer.isValid():
+            return None
+        box = item.boundingRect()
+        if box.width() <= 0 or box.height() <= 0:
+            return None
+        scale = min(max_w / box.width(), max_h / box.height())
+        w = max(1, int(round(box.width() * scale)))
+        h = max(1, int(round(box.height() * scale)))
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(QColor("#ffffff"))
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            renderer.render(painter, QRectF(0, 0, w, h))
+        finally:
+            painter.end()
+        return QPixmap.fromImage(img)
+
+    def _refresh_navigator(self) -> None:
+        thumb = self._build_navigator_thumb()
+        self._nav.set_drawing(thumb, self._content_rect())
+        if thumb is not None and self._nav_wanted:
+            self._nav.show()
+            self._nav.raise_()
+            self._nav.anchor_to_parent()
+        else:
+            self._nav.hide()
+        self._update_navigator_view()
+        self.navigatorVisibilityChanged.emit(self._nav_wanted)
+
+    def _update_navigator_view(self) -> None:
+        if not self._nav.isVisible():
+            return
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        self._nav.set_view_rect(visible)
+
+    # -- requests coming back from the map ---------------------------- #
+
+    def _nav_center_on(self, scene_pt: QPointF) -> None:
+        self.centerOn(scene_pt)
+        self._update_navigator_view()
+        self._schedule_detail()
+
+    def _nav_fit_rect(self, rect: QRectF) -> None:
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        zoom = self.transform().m11()
+        if zoom > _MAX_ZOOM or zoom < _MIN_ZOOM:
+            # Snap back inside the allowed range rather than leaving the
+            # view somewhere the wheel cannot get out of.
+            clamped = min(_MAX_ZOOM, max(_MIN_ZOOM, zoom))
+            self.scale(clamped / zoom, clamped / zoom)
+            zoom = clamped
+        self._current_zoom = zoom
+        self._update_sampling()
+        self._schedule_detail()
+        self._update_navigator_view()
+
+    def _nav_zoom(self, steps: int) -> None:
+        factor = _ZOOM_FACTOR if steps > 0 else 1.0 / _ZOOM_FACTOR
+        new_zoom = self._current_zoom * factor
+        if not (_MIN_ZOOM <= new_zoom <= _MAX_ZOOM):
+            return
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.scale(factor, factor)
+        self.setTransformationAnchor(anchor)
+        self._current_zoom = new_zoom
+        self._update_sampling()
+        self._schedule_detail()
+        self._update_navigator_view()
+
+    # ------------------------------------------------------------------ #
     #  Mouse events
     # ------------------------------------------------------------------ #
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._nav.isVisible():
+            self._nav.anchor_to_parent()
+        self._update_navigator_view()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
@@ -374,6 +521,7 @@ class DrawingCanvas(QGraphicsView):
             self._current_zoom = new_zoom
             self._update_sampling()
             self._schedule_detail()
+            self._update_navigator_view()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -410,6 +558,7 @@ class DrawingCanvas(QGraphicsView):
             self.verticalScrollBar().setValue(
                 self.verticalScrollBar().value() - int(delta.y())
             )
+            self._update_navigator_view()
             event.accept()
         else:
             super().mouseMoveEvent(event)

@@ -55,11 +55,14 @@ DXF and DWFx work without it.
 ```bat
 python tests\test_dwfx.py
 python tests\test_converter_dwfx.py
+python tests\test_navigator.py
 ```
 
-Both run on the standard library alone (they stub ezdxf if it is
+The first two run on the standard library alone (they stub ezdxf if it is
 missing) and build their own synthetic DWFx packages, so no sample
-drawings are needed.
+drawings are needed. `test_navigator.py` drives the navigator and the
+panel toggles through real Qt events on the offscreen platform, and
+skips itself if PyQt6 is not installed.
 
 ## Diagnostics
 
@@ -78,9 +81,26 @@ arguments.
 | `M` | Measure mode |
 | `P` | Pan mode |
 | `R` | Re-render after toggling layers |
+| `N` | Show / hide the navigator |
+| `Ctrl`+`1` | Show / hide the file browser |
+| `Ctrl`+`2` | Show / hide the layer panel |
+| `Ctrl`+`\` | Show / hide both side panels |
 | `←` `→` | Previous / next file |
 
 Middle-drag (or Alt+left-drag) pans; the scroll wheel zooms.
+
+## Navigator
+
+The navigator is a miniature of the whole sheet in the bottom-right
+corner of the drawing area, with a box marking the part you are looking
+at. Drag the box to pan, drag out a new box on the map to zoom straight
+to that region (hold `Shift` to draw one inside the current box), click
+anywhere to jump there, and roll the wheel over it to zoom. Drag its
+title strip to move it out of the way, or `✕` / `N` to put it away
+entirely — the choice sticks for the next drawing.
+
+Because it floats over the canvas rather than living in a panel, it is
+still there with both side panels hidden.
 
 ## Thumbnails
 

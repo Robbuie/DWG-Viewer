@@ -104,6 +104,8 @@ class MainWindow(QMainWindow):
     #  UI construction
     # ------------------------------------------------------------------ #
 
+    _PANEL_MIN = 140          # narrowest a side panel is still useful at
+
     def _build_ui(self):
         # Outer splitter: file browser | canvas | layers
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -133,6 +135,10 @@ class MainWindow(QMainWindow):
 
         # Proportions: browser 18%, canvas 64%, layers 18%
         splitter.setSizes([252, 896, 252])
+        splitter.setCollapsible(1, False)     # never lose the drawing itself
+        self._splitter = splitter
+        # Widths to restore a panel to after it has been hidden.
+        self._panel_widths = [252, 252]
         self.setCentralWidget(splitter)
 
     def _build_toolbar(self):
@@ -192,6 +198,43 @@ class MainWindow(QMainWindow):
         self._act_measure.setCheckable(True)
         self._act_measure.triggered.connect(self._set_measure_mode)
         tb.addAction(self._act_measure)
+
+        tb.addSeparator()
+
+        # View controls: overview map and the two side panels
+        self._act_nav = QAction("🗺  Navigator", self)
+        self._act_nav.setToolTip(
+            "Overview map — drag the box to pan, drag a new box to zoom (N)")
+        self._act_nav.setShortcut(QKeySequence("N"))
+        self._act_nav.setCheckable(True)
+        self._act_nav.setChecked(True)
+        self._act_nav.toggled.connect(self._canvas.set_navigator_visible)
+        self._canvas.navigatorVisibilityChanged.connect(self._sync_nav_action)
+        tb.addAction(self._act_nav)
+
+        self._act_files = QAction("📁  Files", self)
+        self._act_files.setToolTip("Show/hide the file browser (Ctrl+1)")
+        self._act_files.setShortcut(QKeySequence("Ctrl+1"))
+        self._act_files.setCheckable(True)
+        self._act_files.setChecked(True)
+        self._act_files.toggled.connect(
+            lambda on: self._set_panel_visible(0, on))
+        tb.addAction(self._act_files)
+
+        self._act_layers_panel = QAction("🗂  Layers", self)
+        self._act_layers_panel.setToolTip("Show/hide the layer panel (Ctrl+2)")
+        self._act_layers_panel.setShortcut(QKeySequence("Ctrl+2"))
+        self._act_layers_panel.setCheckable(True)
+        self._act_layers_panel.setChecked(True)
+        self._act_layers_panel.toggled.connect(
+            lambda on: self._set_panel_visible(2, on))
+        tb.addAction(self._act_layers_panel)
+
+        # Both at once — hidden from the toolbar, it is just a shortcut.
+        act_both = QAction("Toggle both side panels", self)
+        act_both.setShortcut(QKeySequence("Ctrl+\\"))
+        act_both.triggered.connect(self._toggle_both_panels)
+        self.addAction(act_both)
 
         tb.addSeparator()
 
@@ -302,6 +345,51 @@ class MainWindow(QMainWindow):
         self._act_pan.setChecked(False)
         self._canvas.set_pan_mode(False)
         self._canvas.set_measure_mode(True)
+
+    # ------------------------------------------------------------------ #
+    #  Panel visibility
+    # ------------------------------------------------------------------ #
+
+    def _set_panel_visible(self, index: int, visible: bool) -> None:
+        """Collapse or restore a side panel.
+
+        The width it had is kept, so bringing a panel back does not leave
+        it as a sliver or eat half the drawing area.
+        """
+        widget = self._splitter.widget(index)
+        if widget is None or widget.isVisible() == visible:
+            return
+        slot = 0 if index == 0 else 1
+        if not visible:
+            current = self._splitter.sizes()[index]
+            if current >= self._PANEL_MIN:
+                self._panel_widths[slot] = current
+            widget.hide()
+        else:
+            widget.show()
+        self._apply_panel_widths()
+
+    def _apply_panel_widths(self) -> None:
+        total = max(1, self._splitter.width() - 2 * self._splitter.handleWidth())
+        left = self._panel_widths[0] if self._splitter.widget(0).isVisible() else 0
+        right = self._panel_widths[1] if self._splitter.widget(2).isVisible() else 0
+        centre = total - left - right
+        if centre < 200:            # never squeeze the drawing out
+            left = right = 0
+            centre = total
+        self._splitter.setSizes([left, centre, right])
+
+    def _toggle_both_panels(self) -> None:
+        show = not (self._act_files.isChecked() or self._act_layers_panel.isChecked())
+        self._act_files.setChecked(show)
+        self._act_layers_panel.setChecked(show)
+
+    def _sync_nav_action(self, visible: bool) -> None:
+        """Keep the toolbar button honest when the map closes itself."""
+        if self._act_nav.isChecked() != visible:
+            self._act_nav.blockSignals(True)
+            self._act_nav.setChecked(visible)
+            self._act_nav.blockSignals(False)
 
     def _navigate_file(self, delta: int):
         self._browser.select_next(delta)

@@ -1,8 +1,14 @@
 """
-converter.py — DWG/DXF loading and SVG rendering.
+converter.py — drawing loading and SVG rendering.
 
-ezdxf only reads DXF. DWG files are converted to DXF first via the
-free ODA File Converter, then rendered with ezdxf.
+Three input paths, all ending in an SVG string:
+  * DXF   — read directly by ezdxf
+  * DWG   — converted to DXF by the free ODA File Converter, then ezdxf
+  * DWFx  — an XPS/OPC package, translated to SVG by src/dwfx.py with no
+            external converter at all
+
+Classic DWF (version 6 and earlier) stores its graphics as binary
+WHIP!/W2D streams and is detected but not yet rendered.
 
 ODA File Converter (free):  https://www.opendesign.com/guestfiles/oda_file_converter
 """
@@ -15,6 +21,8 @@ from ezdxf import recover as ezdxf_recover
 from ezdxf.addons.drawing import RenderContext, Frontend
 from ezdxf.addons.drawing.svg import SVGBackend
 from ezdxf.addons.drawing import layout as drawing_layout
+
+from src import dwfx
 
 # ── Global ODA lock ───────────────────────────────────────────────────
 #
@@ -126,7 +134,7 @@ class NeedODAConverter(DrawingError):
 # ── DWG → DXF conversion ─────────────────────────────────────────────
 
 def _dwg_to_dxf(dwg_path: Path) -> Path:
-    """Convert a single DWG or DWF to a temp DXF file via ODA File Converter.
+    """Convert a single DWG to a temp DXF file via ODA File Converter.
     Acquires _oda_lock so this never runs concurrently with the batch
     thumbnail converter."""
     exe = oda_path()
@@ -199,24 +207,51 @@ class DWGConverter:
         self._tmp_dxf: Path | None = None
         self._owns_tmp: bool = False   # False when using cached DXF
         self._layer_vis: dict[str, bool] = {}
+        self._dwfx: dwfx.DwfxDocument | None = None
+        self._sheet: int = 0
 
     def load(self) -> None:
         suffix = self.filepath.suffix.lower()
+        if suffix in (".dwf", ".dwfx"):
+            self._load_dwfx()      # keeps its own layer state
+            return
         if suffix == ".dwg":
             self._load_dwg()
         elif suffix == ".dxf":
             self._load_dxf(self.filepath)
-        elif suffix == ".dwf":
-            raise DrawingError(
-                "DWF files are not supported.\n\n"
-                "DWF (Design Web Format) is Autodesk's web publishing format and "
-                "cannot be converted by ODA File Converter.\n\n"
-                "To view a DWF file, try Autodesk Design Review or export the "
-                "original drawing as DWG/DXF from your CAD application."
-            )
         else:
             raise DrawingError(f"Unsupported file type: {suffix}")
         self._init_layers()
+
+    # -- DWFx ---------------------------------------------------------
+
+    def _load_dwfx(self) -> None:
+        """Read a DWFx package directly. The extension is not trusted:
+        DWFx is occasionally published as .dwf, and .dwfx files that turn
+        out to be classic DWF should get the classic-DWF message."""
+        if dwfx.is_dwfx_package(self.filepath):
+            try:
+                self._dwfx = dwfx.DwfxDocument(self.filepath)
+            except dwfx.DwfxError as exc:
+                raise DrawingError(str(exc)) from exc
+            self._sheet = 0
+            self._layer_vis = {name: True for name in self._dwfx.layers(0)}
+            return
+
+        if dwfx.is_classic_dwf(self.filepath):
+            raise DrawingError(
+                "This is a classic DWF file (DWF 6 or earlier).\n\n"
+                "Its geometry is stored as binary WHIP!/W2D streams, which this "
+                "viewer cannot read yet — only the newer XPS-based DWFx format "
+                "is supported.\n\n"
+                "Re-publish the sheet as DWFx from AutoCAD (PUBLISH, then choose "
+                "DWFx), or export the drawing as DWG/DXF."
+            )
+
+        raise DrawingError(
+            "This file is not a readable DWF or DWFx package.\n\n"
+            "It may be damaged, or it may be a renamed file of another type."
+        )
 
     def _load_dwg(self) -> None:
         dxf_path = _dwg_to_dxf(self.filepath)
@@ -242,6 +277,9 @@ class DWGConverter:
             raise DrawingError(f"Unexpected error reading file: {exc}") from exc
 
     def close(self) -> None:
+        if self._dwfx is not None:
+            self._dwfx.close()
+            self._dwfx = None
         if self._owns_tmp and self._tmp_dxf and self._tmp_dxf.exists():
             try:   self._tmp_dxf.unlink()
             except OSError: pass
@@ -254,6 +292,12 @@ class DWGConverter:
         self._layer_vis = {l.dxf.name: l.is_on() for l in self._doc.layers}
 
     def get_layers(self) -> list[dict]:
+        if self._dwfx is not None:
+            # DWFx has no CAD layer table; named Canvas groups are the
+            # nearest equivalent, and they carry no colour of their own.
+            return [{"name": name, "color_index": 7, "color_hex": "#c8c8c8",
+                     "visible": self._layer_vis.get(name, True)}
+                    for name in self._dwfx.layers(self._sheet)]
         if not self._doc: return []
         result = []
         for layer in self._doc.layers:
@@ -280,6 +324,9 @@ class DWGConverter:
         return back.get_string(page)
 
     def render_svg(self, width_px: int = 1600, height_px: int = 1200) -> str:
+        if self._dwfx is not None:
+            hidden = {n for n, on in self._layer_vis.items() if not on}
+            return self._dwfx.render_svg(self._sheet, width_px, height_px, hidden)
         if not self._doc: raise DrawingError("No document loaded.")
         for layer in self._doc.layers:
             name = layer.dxf.name
@@ -287,9 +334,26 @@ class DWGConverter:
         return self._render(width_px, height_px)
 
     def render_thumbnail_svg(self, width_px: int = 300, height_px: int = 200) -> str:
+        if self._dwfx is not None:
+            return self._dwfx.render_svg(self._sheet, width_px, height_px)
         if not self._doc: raise DrawingError("No document loaded.")
         for layer in self._doc.layers: layer.on()
         return self._render(width_px, height_px)
+
+    # -- sheets (DWFx packages hold a whole drawing set) ---------------
+
+    @property
+    def sheet_count(self) -> int:
+        return self._dwfx.sheet_count if self._dwfx is not None else 1
+
+    def sheet_names(self) -> list[str]:
+        return self._dwfx.sheet_names() if self._dwfx is not None else []
+
+    def set_sheet(self, index: int) -> None:
+        if self._dwfx is None or not 0 <= index < self._dwfx.sheet_count:
+            return
+        self._sheet = index
+        self._layer_vis = {name: True for name in self._dwfx.layers(index)}
 
     @property
     def doc(self): return self._doc

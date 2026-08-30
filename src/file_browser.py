@@ -1,5 +1,5 @@
 """
-file_browser.py — left panel: folder selector + DWG/DXF icon grid.
+file_browser.py — left panel: folder selector + drawing icon grid.
 
 Thumbnail pipeline
 ──────────────────
@@ -16,7 +16,7 @@ For each requested file, in order of cost:
      • embedded DWG preview bitmap, read via the header's image-seeker
      • Windows Shell / eDrawings thumbnail handler
      • extension-badge placeholder so a tile is never blank
-3. DXF render worker (render pool)     — native .dxf, no ODA needed
+3. DXF/DWFx render worker (render pool) — native .dxf and .dwfx, no ODA
 4. Batch ODA worker (1 at a time)      — uncached .dwg, in chunks, with
    results streamed to the render pool as ODA writes each file
 
@@ -38,7 +38,8 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore    import (Qt, QRunnable, QThreadPool, pyqtSignal, QObject,
-                             QSize, QByteArray, QBuffer, QIODevice, QTimer, QRect)
+                             QSize, QByteArray, QBuffer, QIODevice, QTimer, QRect,
+                             QRectF)
 from PyQt6.QtGui     import QPixmap, QImage, QColor, QIcon, QPainter, QFont
 from PyQt6.QtSvg     import QSvgRenderer
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
@@ -47,7 +48,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
 
 _THUMB_W, _THUMB_H = 160, 110
 _RENDER_SCALE      = 2               # cache at 2x for crisp hi-DPI display
-_SUPPORTED         = {".dwg", ".dxf"}
+_SUPPORTED         = {".dwg", ".dxf", ".dwf", ".dwfx"}
 
 # How far beyond the visible area to pre-load, as a multiple of one
 # viewport height. 1.0 means "one screen above and one below", which is
@@ -137,7 +138,15 @@ def _svg_to_image(svg_string: str, w: int, h: int) -> QImage | None:
         img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(QColor("#1e1e1e"))
         p = QPainter(img)
-        rnd.render(p)
+        # Fit rather than stretch: sheet drawings are rarely the same
+        # aspect ratio as the thumbnail tile.
+        native = rnd.defaultSize()
+        if native.width() > 0 and native.height() > 0:
+            scale = min(w / native.width(), h / native.height())
+            tw, th = native.width() * scale, native.height() * scale
+            rnd.render(p, QRectF((w - tw) / 2, (h - th) / 2, tw, th))
+        else:
+            rnd.render(p)
         p.end()
         return img
     except Exception:
@@ -161,6 +170,21 @@ def _render_dxf_to_svg(dxf_path: str, w: int, h: int) -> str | None:
         Frontend(ctx, back).draw_layout(msp)
         page = drawing_layout.Page(w, h, drawing_layout.Units.px)
         return back.get_string(page)
+    except Exception:
+        return None
+
+
+def _render_dwfx_to_svg(path: str, w: int, h: int) -> str | None:
+    """Render sheet 1 of a DWFx package to an SVG string.
+
+    Classic DWF lands here too and returns None, which leaves the file
+    showing its extension badge instead of a thumbnail.
+    """
+    try:
+        from src import dwfx
+        if not dwfx.is_dwfx_package(path):
+            return None
+        return dwfx.render_sheet_svg(path, 0, w, h)
     except Exception:
         return None
 
@@ -317,28 +341,32 @@ class _BatchOdaThumbWorker(QRunnable):
 # ── Worker 3: DXF render ─────────────────────────────────────────────
 
 class _DxfRenderWorker(QRunnable):
-    """Render one DXF to a thumbnail and cache it as PNG.
+    """Render one drawing to a thumbnail and cache it as PNG.
+
+    Defaults to the ezdxf DXF renderer; pass render_fn to use another
+    (DWFx packages render themselves, with no converter in the middle).
 
     Only emits on success, so the badge placed by the fast worker stays
     put when a drawing cannot be rendered.
     """
     def __init__(self, gen: int, orig_fp: str, dxf_path: str,
-                 signals: _Signals, is_current):
+                 signals: _Signals, is_current, render_fn=None):
         super().__init__()
         self.gen         = gen
         self.orig_fp     = orig_fp
         self.dxf_path    = dxf_path
         self.signals     = signals
         self._is_current = is_current
+        self._render_fn  = render_fn or _render_dxf_to_svg
         self.setAutoDelete(True)
 
     def run(self):
         if not self._is_current(self.gen):
             return
         try:
-            svg = _render_dxf_to_svg(self.dxf_path,
-                                     _THUMB_W * _RENDER_SCALE,
-                                     _THUMB_H * _RENDER_SCALE)
+            svg = self._render_fn(self.dxf_path,
+                                  _THUMB_W * _RENDER_SCALE,
+                                  _THUMB_H * _RENDER_SCALE)
             if not svg:
                 if _cache:
                     _cache.mark_failure(Path(self.orig_fp))
@@ -366,7 +394,7 @@ class _DxfRenderWorker(QRunnable):
 # ── FileBrowser widget ───────────────────────────────────────────────
 
 class FileBrowser(QWidget):
-    """Left panel: folder path bar + scrollable DWG/DXF icon grid."""
+    """Left panel: folder path bar + scrollable drawing icon grid."""
 
     fileSelected = pyqtSignal(str)
 
@@ -475,7 +503,7 @@ class FileBrowser(QWidget):
 
     def _browse(self):
         start = str(self._folder) if self._folder else ""
-        f = QFileDialog.getExistingDirectory(self, "Select DWG folder", start)
+        f = QFileDialog.getExistingDirectory(self, "Select drawing folder", start)
         if f:
             self.open_folder(f)
 
@@ -533,7 +561,7 @@ class FileBrowser(QWidget):
             return
 
         if not files:
-            self._count.setText("No DWG/DXF files found")
+            self._count.setText("No drawing files found")
             return
 
         n = len(files)
@@ -614,6 +642,15 @@ class FileBrowser(QWidget):
         if suffix == ".dxf":
             self._render_pool.start(
                 _DxfRenderWorker(gen, fp, fp, self._signals, self._is_current))
+            return False
+
+        # 3b. DWFx carries its own drawable markup — no converter either.
+        if suffix in (".dwf", ".dwfx"):
+            if _cache is not None and _cache.is_known_failure(path):
+                return False
+            self._render_pool.start(
+                _DxfRenderWorker(gen, fp, fp, self._signals, self._is_current,
+                                 render_fn=_render_dwfx_to_svg))
             return False
 
         # 4. DWG needs ODA, unless we already know it cannot be converted.

@@ -10,7 +10,7 @@ from PyQt6.QtGui import QAction, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QLabel,
     QToolBar, QWidget, QProgressBar, QMessageBox,
-    QFileDialog, QSizePolicy,
+    QFileDialog, QSizePolicy, QComboBox,
 )
 
 from src.file_browser import FileBrowser
@@ -169,6 +169,23 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        # Sheet picker — hidden unless the file holds a drawing set,
+        # which today means a multi-sheet DWFx package.
+        self._sheet_box = QComboBox()
+        self._sheet_box.setToolTip("Sheet within this DWFx package")
+        self._sheet_box.setMinimumWidth(140)
+        self._sheet_box.setStyleSheet(
+            "QComboBox { background: #3a3a3a; color: #ccc; border: 1px solid #555;"
+            " border-radius: 3px; padding: 2px 6px; }"
+            "QComboBox QAbstractItemView { background: #2d2d2d; color: #ccc;"
+            " selection-background-color: #3a6ea8; }"
+        )
+        self._sheet_box.currentIndexChanged.connect(self._on_sheet_changed)
+        self._sheet_action = tb.addWidget(self._sheet_box)
+        self._sheet_action.setVisible(False)
+
+        tb.addSeparator()
+
         # Re-render (apply layer changes)
         act_render = QAction("🔄  Apply Layers", self)
         act_render.setToolTip("Re-render with current layer visibility (R)")
@@ -201,9 +218,10 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "DWG/DXF drawing viewer.<br>"
-            "Thumbnails and drawings are rendered with ezdxf; "
-            "DWG conversion uses the free ODA File Converter.")
+            "DWG, DXF and DWFx drawing viewer.<br>"
+            "DWG/DXF are rendered with ezdxf and DWG conversion uses the "
+            "free ODA File Converter; DWFx sheets are read directly from "
+            "their XPS package.")
 
     def _build_statusbar(self):
         sb = QStatusBar()
@@ -290,18 +308,39 @@ class MainWindow(QMainWindow):
 
     def _on_load_finished(self, conv: DWGConverter, layers: list, svg: str):
         self._current_conv = conv
+        self._populate_sheets(conv)
         self._layers.populate(layers)
         self._canvas.load_svg(svg)
         name = conv.filepath.name
         self._file_label.setText(f"{name}  ({len(layers)} layers)")
         self._progress.setVisible(False)
 
+    def _populate_sheets(self, conv: DWGConverter | None):
+        names = conv.sheet_names() if conv is not None else []
+        multi = len(names) > 1
+        self._sheet_box.blockSignals(True)
+        self._sheet_box.clear()
+        if multi:
+            self._sheet_box.addItems(names)
+            self._sheet_box.setCurrentIndex(0)
+        self._sheet_box.blockSignals(False)
+        self._sheet_action.setVisible(multi)
+
+    def _on_sheet_changed(self, index: int):
+        conv = self._current_conv
+        if conv is None or index < 0:
+            return
+        conv.set_sheet(index)
+        self._layers.populate(conv.get_layers())
+        self._start_render()
+
     def _on_load_error(self, message: str):
         self._progress.setVisible(False)
         self._file_label.setText("Error loading file")
         QMessageBox.critical(
             self, "Cannot open file",
-            f"{message}\n\nMake sure the file is a valid DWG/DXF (R2000–R2018)."
+            f"{message}\n\nSupported files are DWG and DXF (R2000–R2018) "
+            f"and DWFx."
         )
 
     def _start_render(self):

@@ -94,7 +94,15 @@ class _Signals(QObject):
     with a few hundred files that is a few hundred allocations and
     cross-thread connections before any drawing is read.
     """
-    done = pyqtSignal(int, str, QImage)      # generation, path, image
+    done = pyqtSignal(int, str, QImage, int)  # generation, path, image, rank
+
+
+# Result quality. Workers race — the fast placeholder path can finish
+# after a real render — so a lower-ranked image never replaces a
+# higher-ranked one that already landed.
+_RANK_BADGE   = 0      # extension badge: we have nothing
+_RANK_PREVIEW = 1      # embedded DWG preview or Windows Shell handler
+_RANK_FINAL   = 2      # our own render, or the cached PNG of one
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -203,11 +211,12 @@ class _CacheLoadWorker(QRunnable):
             if data:
                 img = QImage()
                 if img.loadFromData(QByteArray(data), "PNG") and not img.isNull():
-                    self.signals.done.emit(self.gen, self.filepath, img)
+                    self.signals.done.emit(self.gen, self.filepath, img, _RANK_FINAL)
                     return
         except Exception:
             pass
-        self.signals.done.emit(self.gen, self.filepath, _badge_image(self.filepath))
+        self.signals.done.emit(self.gen, self.filepath,
+                               _badge_image(self.filepath), _RANK_BADGE)
 
 
 # ── Worker 1: fast per-file (embedded preview / Shell) ───────────────
@@ -229,11 +238,11 @@ class _FastThumbWorker(QRunnable):
             from src.preview import get_thumbnail_image
             img = get_thumbnail_image(fp, _THUMB_W, _THUMB_H)
             if img is not None and not img.isNull():
-                self.signals.done.emit(self.gen, fp, img)
+                self.signals.done.emit(self.gen, fp, img, _RANK_PREVIEW)
                 return
         except Exception:
             pass
-        self.signals.done.emit(self.gen, fp, _badge_image(fp))
+        self.signals.done.emit(self.gen, fp, _badge_image(fp), _RANK_BADGE)
 
 
 # ── Worker 2: batch ODA ──────────────────────────────────────────────
@@ -386,9 +395,59 @@ class _DxfRenderWorker(QRunnable):
                 except Exception:
                     pass
 
-            self.signals.done.emit(self.gen, self.orig_fp, img)
+            self.signals.done.emit(self.gen, self.orig_fp, img, _RANK_FINAL)
         except Exception:
             pass
+
+
+# ── Worker 4: DWF / DWFx thumbnail ───────────────────────────────────
+
+class _DwfThumbWorker(QRunnable):
+    """DWFx sheets are rendered; classic DWF falls back to the plotted
+    preview AutoCAD embeds when publishing, which is the only thing we
+    can show for those until the W2D decoder exists."""
+
+    def __init__(self, gen: int, filepath: str, signals: _Signals, is_current):
+        super().__init__()
+        self.gen, self.filepath, self.signals = gen, filepath, signals
+        self._is_current = is_current
+        self.setAutoDelete(True)
+
+    def run(self):
+        if not self._is_current(self.gen):
+            return
+        try:
+            img = self._build()
+            if img is None or img.isNull():
+                if _cache:
+                    _cache.mark_failure(Path(self.filepath))
+                return
+            if _cache:
+                try:
+                    _cache.store_png(Path(self.filepath), _image_to_png_bytes(img))
+                except Exception:
+                    pass
+            self.signals.done.emit(self.gen, self.filepath, img, _RANK_FINAL)
+        except Exception:
+            pass
+
+    def _build(self) -> QImage | None:
+        from src import dwfx
+        if dwfx.is_dwfx_package(self.filepath):
+            svg = _render_dwfx_to_svg(self.filepath,
+                                      _THUMB_W * _RENDER_SCALE,
+                                      _THUMB_H * _RENDER_SCALE)
+            return _svg_to_image(svg, _THUMB_W * _RENDER_SCALE,
+                                 _THUMB_H * _RENDER_SCALE) if svg else None
+
+        from src import dwf as classic
+        data = classic.thumbnail_png(self.filepath)
+        if not data:
+            return None
+        img = QImage()
+        if not img.loadFromData(QByteArray(data), "PNG") or img.isNull():
+            return None
+        return img
 
 
 # ── FileBrowser widget ───────────────────────────────────────────────
@@ -419,6 +478,7 @@ class FileBrowser(QWidget):
 
         self._items: dict[str, QListWidgetItem] = {}
         self._requested: set[str] = set()
+        self._rank: dict[str, int] = {}      # best result seen per file
         self._pending_dwg: list[str] = []
 
         self._signals = _Signals()
@@ -545,6 +605,7 @@ class FileBrowser(QWidget):
         self._list.clear()
         self._items.clear()
         self._requested.clear()
+        self._rank.clear()
         self._pending_dwg.clear()
 
         if not (self._folder and self._folder.is_dir()):
@@ -644,13 +705,13 @@ class FileBrowser(QWidget):
                 _DxfRenderWorker(gen, fp, fp, self._signals, self._is_current))
             return False
 
-        # 3b. DWFx carries its own drawable markup — no converter either.
+        # 3b. DWFx carries its own drawable markup, and classic DWF at
+        #     least carries a plot preview — no converter either way.
         if suffix in (".dwf", ".dwfx"):
             if _cache is not None and _cache.is_known_failure(path):
                 return False
             self._render_pool.start(
-                _DxfRenderWorker(gen, fp, fp, self._signals, self._is_current,
-                                 render_fn=_render_dwfx_to_svg))
+                _DwfThumbWorker(gen, fp, self._signals, self._is_current))
             return False
 
         # 4. DWG needs ODA, unless we already know it cannot be converted.
@@ -675,12 +736,15 @@ class FileBrowser(QWidget):
 
     # ── Result handling ──────────────────────────────────────────────
 
-    def _on_done(self, gen: int, fp: str, img: QImage):
+    def _on_done(self, gen: int, fp: str, img: QImage, rank: int = _RANK_FINAL):
         if gen != self._gen or img.isNull():
             return
+        if rank < self._rank.get(fp, -1):
+            return          # a better image is already on screen
         item = self._items.get(fp)
         if item is None:
             return
+        self._rank[fp] = rank
         if img.width() > _THUMB_W or img.height() > _THUMB_H:
             img = img.scaled(_THUMB_W, _THUMB_H,
                              Qt.AspectRatioMode.KeepAspectRatio,

@@ -8,7 +8,10 @@ Three input paths, all ending in an SVG string:
             external converter at all
 
 Classic DWF (version 6 and earlier) stores its graphics as binary
-WHIP!/W2D streams and is detected but not yet rendered.
+WHIP!/W2D streams. Those are decoded by src/w2d.py and rasterised by
+src/w2d_render.py — a sheet holds millions of primitives, far too many
+for the SVG route the other formats take, so it becomes a cached
+bitmap instead.
 
 ODA File Converter (free):  https://www.opendesign.com/guestfiles/oda_file_converter
 """
@@ -124,6 +127,11 @@ def aci_to_hex(i: int) -> str:
 
 # ── Exceptions ───────────────────────────────────────────────────────
 
+# Above this many segments in view, a detail redraw costs seconds and
+# improves little — the cached raster is already adequate at that zoom.
+MAX_DETAIL_SEGMENTS = 250_000
+
+
 class DrawingError(Exception):
     pass
 
@@ -208,6 +216,8 @@ class DWGConverter:
         self._owns_tmp: bool = False   # False when using cached DXF
         self._layer_vis: dict[str, bool] = {}
         self._dwfx: dwfx.DwfxDocument | None = None
+        self._classic: bool = False
+        self._geometry = None          # decoded W2D geometry, once asked for
         self._sheet: int = 0
 
     def load(self) -> None:
@@ -239,14 +249,9 @@ class DWGConverter:
             return
 
         if dwfx.is_classic_dwf(self.filepath):
-            raise DrawingError(
-                "This is a classic DWF file (DWF 6 or earlier).\n\n"
-                "Its geometry is stored as binary WHIP!/W2D streams, which this "
-                "viewer cannot read yet — only the newer XPS-based DWFx format "
-                "is supported.\n\n"
-                "Re-publish the sheet as DWFx from AutoCAD (PUBLISH, then choose "
-                "DWFx), or export the drawing as DWG/DXF."
-            )
+            self._classic = True
+            self._layer_vis = {}
+            return
 
         raise DrawingError(
             "This file is not a readable DWF or DWFx package.\n\n"
@@ -277,6 +282,7 @@ class DWGConverter:
             raise DrawingError(f"Unexpected error reading file: {exc}") from exc
 
     def close(self) -> None:
+        self._geometry = None
         if self._dwfx is not None:
             self._dwfx.close()
             self._dwfx = None
@@ -341,6 +347,126 @@ class DWGConverter:
         return self._render(width_px, height_px)
 
     # -- sheets (DWFx packages hold a whole drawing set) ---------------
+
+    # -- classic DWF: decoded to a cached raster -----------------------
+
+    @property
+    def is_raster(self) -> bool:
+        return self._classic
+
+    def render_raster(self, width_px: int | None = None) -> tuple[bytes, tuple]:
+        """PNG bytes plus the drawing's extents in sheet inches.
+
+        Decoding is expensive enough — tens of seconds for a busy
+        sheet — that the result is cached at full resolution and reused
+        on every later open.
+        """
+        from src import w2d_render
+
+        width = width_px or w2d_render.DEFAULT_WIDTH
+        cached = _cache.get_cached_raster(self.filepath, width)
+        if cached:
+            try:
+                from PIL import Image
+                import io as _io
+                with Image.open(_io.BytesIO(cached)) as probe:
+                    w, h = probe.size
+                # The stored box has to be recovered from the sheet, not
+                # from the PNG, so read it back off the stream cheaply.
+                box = self._inches_box(w, h)
+                if box is not None:
+                    return cached, box
+            except Exception:
+                pass
+
+        try:
+            png, box = w2d_render.render_sheet_png(self.filepath, self._sheet, width)
+        except Exception as exc:
+            raise DrawingError(f"Could not decode this DWF sheet: {exc}") from exc
+        try:
+            _cache.store_raster(self.filepath, width, png)
+        except Exception:
+            pass
+        return png, box
+
+    # -- sharp zoom: redraw a region from retained geometry -------------
+
+    def ensure_geometry(self):
+        """Decode the sheet into retained geometry.
+
+        Costs a full pass over the opcode stream, so callers do this once,
+        off the UI thread, and keep the result for as long as the drawing
+        is open.
+        """
+        if self._geometry is None and self._classic:
+            from src import w2d_render
+            self._geometry = w2d_render.decode_geometry(self.filepath, self._sheet)
+        return self._geometry
+
+    @property
+    def has_geometry(self) -> bool:
+        return self._geometry is not None
+
+    def render_detail_png(self, scene_rect, base_size, out_size) -> bytes:
+        """Redraw one rectangle of the sheet at an arbitrary resolution.
+
+        `scene_rect` is in the coordinates of the cached raster, which is
+        what the canvas works in; it is mapped back to drawing coordinates
+        here so the canvas needs to know nothing about the format.
+        """
+        geom = self._geometry
+        if geom is None:
+            return b""
+        import io as _io
+
+        sx0, sy0, sx1, sy1 = scene_rect
+        base_w, base_h = base_size
+        if base_w <= 0 or base_h <= 0:
+            return b""
+
+        vx0, vy0, vx1, vy1 = geom.view
+        span_x, span_y = vx1 - vx0, vy1 - vy0
+        # Raster rows run downward, drawing coordinates run up.
+        region = (vx0 + (sx0 / base_w) * span_x,
+                  vy0 + (1.0 - sy1 / base_h) * span_y,
+                  vx0 + (sx1 / base_w) * span_x,
+                  vy0 + (1.0 - sy0 / base_h) * span_y)
+
+        out_w, out_h = int(out_size[0]), int(out_size[1])
+        if out_w < 2 or out_h < 2:
+            return b""
+        img = geom.render_region(region, out_w, out_h,
+                                 max_segments=MAX_DETAIL_SEGMENTS)
+        if img is None:
+            return b""      # too much in view to be worth redrawing
+        buf = _io.BytesIO()
+        img.save(buf, "PNG", compress_level=1)   # speed over size; it is transient
+        return buf.getvalue()
+
+    def _inches_box(self, width_px: int, height_px: int):
+        """Recover the inches box for a cached raster without decoding
+        the whole graphics stream again."""
+        try:
+            from src import dwf as classic
+            from src import w2d_render
+            with classic.ClassicDwf(self.filepath) as doc:
+                href = doc.sheets[self._sheet].first("2d streaming graphics")
+                if not href:
+                    return None
+                real = doc._names.get(href.replace("\\", "/").lstrip("/").lower())
+                if real is None:
+                    return None
+                with doc._zip.open(real) as fh:
+                    head = fh.read(8192)
+            view = w2d_render.read_view(head)
+            if view is None:
+                return None
+            x0, y0, x1, y1 = view
+            per_unit = w2d_render.read_inches_per_unit(head)
+            return (0.0, (y1 - y0) * per_unit, (x1 - x0) * per_unit,
+                    -(y1 - y0) * per_unit)
+        except Exception:
+            return None
 
     @property
     def sheet_count(self) -> int:

@@ -9,7 +9,7 @@ never drift apart.
 Bump this, commit, then tag: git tag v1.0.1 && git push --tags
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # GitHub repository that publishes releases. Update these two lines
 # once, after you create the repo.

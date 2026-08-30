@@ -25,8 +25,29 @@ from src.update_ui import UpdateChecker
 #  Background loader thread
 # ------------------------------------------------------------------ #
 
+class _GeometryWorker(QThread):
+    """Decodes a classic DWF sheet into retained geometry in the
+    background, so sharp zooming becomes available a little after the
+    drawing itself appears rather than holding it up."""
+
+    ready = pyqtSignal(object)
+
+    def __init__(self, conv):
+        super().__init__()
+        self._conv = conv
+
+    def run(self):
+        try:
+            self._conv.ensure_geometry()
+        except Exception:
+            return
+        self.ready.emit(self._conv)
+
+
 class _LoadSignals(QObject):
-    finished = pyqtSignal(object, list, str)   # converter, layers, svg
+    # converter, layers, svg, png bytes, extents — a drawing arrives as
+    # one or the other: vector formats as SVG, classic DWF as a raster.
+    finished = pyqtSignal(object, list, str, object, object)
     error = pyqtSignal(str)
 
 
@@ -42,8 +63,12 @@ class _LoadWorker(QThread):
             conv = DWGConverter(self.filepath)
             conv.load()
             layers = conv.get_layers()
-            svg = conv.render_svg()
-            self.signals.finished.emit(conv, layers, svg)
+            if conv.is_raster:
+                png, extents = conv.render_raster()
+                self.signals.finished.emit(conv, layers, "", png, extents)
+            else:
+                svg = conv.render_svg()
+                self.signals.finished.emit(conv, layers, svg, None, None)
         except DrawingError as exc:
             self.signals.error.emit(str(exc))
         except Exception as exc:
@@ -62,6 +87,7 @@ class MainWindow(QMainWindow):
 
         self._current_conv: DWGConverter | None = None
         self._load_worker: _LoadWorker | None = None
+        self._geometry_worker: _GeometryWorker | None = None
 
         self._updater = UpdateChecker(self)
 
@@ -296,7 +322,7 @@ class MainWindow(QMainWindow):
         self._current_conv = None
         self._canvas.clear()
         self._layers.clear()
-        self._file_label.setText(f"Loading: {Path(filepath).name} …")
+        self._file_label.setText(self._loading_message(filepath))
         self._progress.setVisible(True)
 
         worker = _LoadWorker(filepath)
@@ -306,14 +332,66 @@ class MainWindow(QMainWindow):
         self._load_worker = worker
         worker.start()
 
-    def _on_load_finished(self, conv: DWGConverter, layers: list, svg: str):
+    @staticmethod
+    def _loading_message(filepath: str) -> str:
+        """Classic DWF is decoded from scratch the first time and can take
+        a minute, so say so rather than looking hung."""
+        name = Path(filepath).name
+        try:
+            from src import dwfx, cache, w2d_render
+            if dwfx.is_classic_dwf(filepath):
+                if cache.get_cached_raster(Path(filepath),
+                                           w2d_render.DEFAULT_WIDTH) is None:
+                    return (f"Decoding {name} — first open only, this can take "
+                            f"a minute. Later opens are instant.")
+        except Exception:
+            pass
+        return f"Loading: {name} …"
+
+    def _on_load_finished(self, conv: DWGConverter, layers: list, svg: str,
+                          png=None, extents=None):
         self._current_conv = conv
         self._populate_sheets(conv)
         self._layers.populate(layers)
-        self._canvas.load_svg(svg)
+        self._canvas.set_detail_provider(None)
+        if png:
+            if not self._canvas.load_image(png, extents):
+                self._progress.setVisible(False)
+                self._on_load_error(
+                    "The decoded drawing could not be displayed.\n\n"
+                    "This is usually Qt refusing a very large image. Try "
+                    "restarting the viewer; if it persists, the sheet may "
+                    "need to be rendered at a lower resolution."
+                )
+                return
+        else:
+            self._canvas.load_svg(svg)
         name = conv.filepath.name
-        self._file_label.setText(f"{name}  ({len(layers)} layers)")
+        detail = "rasterised" if png else f"{len(layers)} layers"
+        self._file_label.setText(f"{name}  ({detail})")
         self._progress.setVisible(False)
+
+        if png and conv.is_raster:
+            self._start_geometry(conv)
+
+    def _start_geometry(self, conv: DWGConverter) -> None:
+        """Decode geometry behind the drawing so deep zoom can be redrawn
+        sharply instead of magnifying the raster."""
+        if self._geometry_worker is not None and self._geometry_worker.isRunning():
+            self._geometry_worker.terminate()
+        worker = _GeometryWorker(conv)
+        worker.ready.connect(self._on_geometry_ready)
+        worker.finished.connect(worker.deleteLater)
+        self._geometry_worker = worker
+        worker.start()
+
+    def _on_geometry_ready(self, conv: DWGConverter) -> None:
+        if conv is not self._current_conv:
+            return          # a different drawing was opened meanwhile
+        self._canvas.set_detail_provider(conv.render_detail_png)
+        self.statusBar().showMessage(
+            "Sharp zoom ready — the drawing is now redrawn at full detail "
+            "as you zoom in.", 5000)
 
     def _populate_sheets(self, conv: DWGConverter | None):
         names = conv.sheet_names() if conv is not None else []
@@ -347,6 +425,8 @@ class MainWindow(QMainWindow):
         """Re-render the current drawing (called after layer toggle)."""
         if self._current_conv is None:
             return
+        if self._current_conv.is_raster:
+            return          # a raster has no layer state to re-apply
         self._progress.setVisible(True)
 
         class _RenderWorker(QThread):

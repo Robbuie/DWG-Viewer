@@ -10,3 +10,6 @@ _backup_*/
 .vscode/
 .idea/
 *.log
+
+# Sample drawings dropped in for debugging — never part of a release.
+samples/

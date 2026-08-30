@@ -6,3 +6,8 @@ PyQt6>=6.4.0
 ezdxf>=1.1.0
 # ezdxf.addons.drawing.frontend imports PIL.Image at module level.
 Pillow>=10.0.0
+
+# Used directly by the classic-DWF decoder to filter millions of
+# segments per viewport redraw. It arrives with ezdxf anyway; pinned
+# here because this app now depends on it in its own right.
+numpy>=1.24

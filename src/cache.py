@@ -45,10 +45,20 @@ def _base_dir() -> Path:
 CACHE_ROOT = _base_dir()
 THUMB_DIR  = CACHE_ROOT / "thumbs"
 DXF_DIR    = CACHE_ROOT / "dxf"
+# Full-resolution rasters of formats that cannot be drawn as vectors
+# fast enough to do it on every open (classic DWF).
+RASTER_DIR = CACHE_ROOT / "raster"
+
+# Bumped whenever the app learns to render something it previously
+# could not. Failure markers are keyed by it, so adding a format never
+# leaves users staring at "we already tried this" for files that would
+# now work — without making them delete their cache by hand.
+RENDERER_GENERATION = 4
 
 # Cache size ceilings — pruned oldest-first on startup.
 MAX_THUMB_FILES = 20_000
 MAX_DXF_BYTES   = 4 * 1024 ** 3      # 4 GB of converted DXFs
+MAX_RASTER_BYTES = 2 * 1024 ** 3     # 2 GB of decoded DWF sheets
 
 _dirs_ready = False
 _dirs_lock  = threading.Lock()
@@ -64,6 +74,7 @@ def _ensure_dirs() -> None:
         try:
             THUMB_DIR.mkdir(parents=True, exist_ok=True)
             DXF_DIR.mkdir(parents=True, exist_ok=True)
+            RASTER_DIR.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
         _dirs_ready = True
@@ -109,7 +120,7 @@ def thumb_png_path(filepath: Path) -> Path:
 
 
 def fail_marker_path(filepath: Path) -> Path:
-    return THUMB_DIR / (cache_key(filepath) + ".none")
+    return THUMB_DIR / f"{cache_key(filepath)}.g{RENDERER_GENERATION}.none"
 
 
 def get_cached_png(filepath: Path) -> bytes | None:
@@ -133,6 +144,28 @@ def has_cached_png(filepath: Path) -> bool:
 def store_png(filepath: Path, data: bytes) -> None:
     if data:
         _atomic_write(thumb_png_path(filepath), data)
+
+
+# ── Full-resolution raster cache ──────────────────────────────────────
+
+def raster_path(filepath: Path, width_px: int) -> Path:
+    return RASTER_DIR / f"{cache_key(filepath)}.w{width_px}.g{RENDERER_GENERATION}.png"
+
+
+def get_cached_raster(filepath: Path, width_px: int) -> bytes | None:
+    p = raster_path(filepath, width_px)
+    try:
+        if p.is_file():
+            return p.read_bytes()
+    except OSError:
+        pass
+    return None
+
+
+def store_raster(filepath: Path, width_px: int, data: bytes) -> None:
+    if data:
+        _ensure_dirs()
+        _atomic_write(raster_path(filepath, width_px), data)
 
 
 def is_known_failure(filepath: Path) -> bool:
@@ -205,6 +238,23 @@ def prune() -> None:
     ignored because a too-large cache is never worth crashing over.
     """
     _ensure_dirs()
+    try:
+        rasters = [(p.stat().st_mtime, p.stat().st_size, p)
+                   for p in RASTER_DIR.iterdir() if p.is_file()]
+        total = sum(size for _, size, _ in rasters)
+        if total > MAX_RASTER_BYTES:
+            rasters.sort()
+            for _, size, p in rasters:
+                if total <= MAX_RASTER_BYTES:
+                    break
+                try:
+                    p.unlink()
+                    total -= size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
     try:
         thumbs = [(p.stat().st_mtime, p) for p in THUMB_DIR.iterdir() if p.is_file()]
         if len(thumbs) > MAX_THUMB_FILES:

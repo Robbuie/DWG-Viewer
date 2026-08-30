@@ -8,15 +8,44 @@ from __future__ import annotations
 import math
 import re
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal, QTimer, QThread, QObject
 from PyQt6.QtGui import (
     QWheelEvent, QMouseEvent, QKeyEvent, QPainter,
-    QPen, QColor, QCursor, QTransform,
+    QPen, QColor, QCursor, QTransform, QPixmap, QImageReader,
 )
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
 from PyQt6.QtSvg import QSvgRenderer
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsEllipseItem
-from PyQt6.QtCore import QByteArray
+from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsLineItem,
+                             QGraphicsEllipseItem, QGraphicsPixmapItem)
+from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
+
+
+class _DetailWorker(QThread):
+    """Renders one detail tile off the UI thread.
+
+    Tiles take a couple of hundred milliseconds, which is fine in the
+    background and a visible stutter on the UI thread. Results carry a
+    token so a tile that finishes after the view has moved is discarded
+    rather than drawn in the wrong place.
+    """
+
+    done = pyqtSignal(int, bytes, float, float, float, float)
+
+    def __init__(self, token, provider, scene_rect, base_size, out_size):
+        super().__init__()
+        self._token = token
+        self._provider = provider
+        self._rect = scene_rect
+        self._base = base_size
+        self._out = out_size
+
+    def run(self):
+        try:
+            png = self._provider(self._rect, self._base, self._out)
+        except Exception:
+            return
+        if png:
+            self.done.emit(self._token, png, *self._rect)
 
 
 _ZOOM_FACTOR = 1.15   # per scroll step
@@ -74,6 +103,19 @@ class DrawingCanvas(QGraphicsView):
         # SVG viewBox (drawing coordinates → scene coordinates mapping)
         self._svg_viewbox: tuple[float, float, float, float] | None = None  # x, y, w, h
 
+        # Detail rendering: a cached raster is fixed at one resolution, so
+        # magnifying past it can only interpolate. When a provider is set,
+        # the visible region is redrawn at the resolution it is actually
+        # being displayed at, and laid over the raster.
+        self._detail_provider = None
+        self._detail_item: QGraphicsPixmapItem | None = None
+        self._detail_worker: "_DetailWorker | None" = None
+        self._detail_token = 0
+        self._detail_timer = QTimer(self)
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.setInterval(220)     # let a burst of zooming settle
+        self._detail_timer.timeout.connect(self._request_detail)
+
     # ------------------------------------------------------------------ #
     #  Public API
     # ------------------------------------------------------------------ #
@@ -109,6 +151,169 @@ class DrawingCanvas(QGraphicsView):
         self._scene.setSceneRect(item.boundingRect())
         self.fit_to_view()
 
+    @staticmethod
+    def _load_downscaled(png_data: bytes) -> QPixmap | None:
+        """Second attempt at half resolution.
+
+        A full-size sheet raster is a few hundred megabytes expanded, and
+        a machine short on memory can refuse it. Half the width is a
+        quarter of the pixels and still sharper than the old default —
+        much better than showing nothing.
+        """
+        try:
+            buf = QBuffer(QByteArray(png_data))
+            buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            reader = QImageReader(buf, b"PNG")
+            size = reader.size()
+            if not size.isValid():
+                return None
+            reader.setScaledSize(size / 2)
+            img = reader.read()
+            if img.isNull():
+                return None
+            pix = QPixmap.fromImage(img)
+            return None if pix.isNull() else pix
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ #
+    #  Detail rendering
+    # ------------------------------------------------------------------ #
+
+    def set_detail_provider(self, provider) -> None:
+        """Supply a callable (scene_rect, base_size, out_size) -> PNG bytes.
+
+        Passing None disables detail rendering and drops any overlay.
+        """
+        self._detail_provider = provider
+        self._clear_detail()
+        if provider is not None:
+            self._schedule_detail()
+
+    def _clear_detail(self) -> None:
+        if self._detail_item is not None:
+            try:
+                self._scene.removeItem(self._detail_item)
+            except Exception:
+                pass
+            self._detail_item = None
+
+    def _schedule_detail(self) -> None:
+        if self._detail_provider is not None and self._svg_item is not None:
+            self._detail_timer.start()
+
+    def _request_detail(self) -> None:
+        provider = self._detail_provider
+        base = self._svg_item
+        if provider is None or not isinstance(base, QGraphicsPixmapItem):
+            return
+
+        scale = self.transform().m11()
+        if scale <= 1.02:
+            # At or below the raster's own resolution it is already as
+            # sharp as a redraw would be.
+            self._clear_detail()
+            return
+
+        base_rect = base.boundingRect()
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        rect = visible.intersected(base_rect)
+        if rect.width() < 1 or rect.height() < 1:
+            return
+
+        out_w = min(4096, max(2, int(rect.width() * scale)))
+        out_h = min(4096, max(2, int(rect.height() * scale)))
+
+        self._detail_token += 1
+        worker = _DetailWorker(
+            self._detail_token, provider,
+            (rect.left(), rect.top(), rect.right(), rect.bottom()),
+            (base_rect.width(), base_rect.height()), (out_w, out_h))
+        worker.done.connect(self._on_detail_ready)
+        worker.finished.connect(worker.deleteLater)
+        self._detail_worker = worker
+        worker.start()
+
+    def _on_detail_ready(self, token: int, png: bytes,
+                         x0: float, y0: float, x1: float, y1: float) -> None:
+        if token != self._detail_token or not png:
+            return          # the view moved on while this was rendering
+        pix = QPixmap()
+        if not pix.loadFromData(QByteArray(png), "PNG") or pix.isNull():
+            return
+
+        self._clear_detail()
+        item = QGraphicsPixmapItem(pix)
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        # The tile was rendered for this scene rectangle; scale it to fit
+        # exactly, so it lines up with the raster underneath.
+        item.setScale(1.0)
+        w = max(1e-6, x1 - x0)
+        h = max(1e-6, y1 - y0)
+        item.setTransform(QTransform().translate(x0, y0).scale(
+            w / pix.width(), h / pix.height()))
+        item.setZValue(1.0)
+        self._scene.addItem(item)
+        self._detail_item = item
+
+    def _update_sampling(self) -> None:
+        """Rasterised drawings are smoothed while shrunk and sampled
+        sharply once magnified past their native resolution.
+
+        Smoothing a magnified bitmap turns thin CAD linework and small
+        text into a blur; nearest-neighbour keeps the strokes hard, which
+        stays readable a good deal further in.
+        """
+        item = self._svg_item
+        if not isinstance(item, QGraphicsPixmapItem):
+            return
+        magnified = self.transform().m11() > 1.0
+        item.setTransformationMode(
+            Qt.TransformationMode.FastTransformation if magnified
+            else Qt.TransformationMode.SmoothTransformation)
+
+    def load_image(self, png_data: bytes,
+                   extents: tuple[float, float, float, float] | None = None) -> bool:
+        """Display a rasterised drawing.
+
+        Classic DWF arrives this way: its sheets carry millions of
+        primitives, so they are decoded once into a high-resolution
+        bitmap rather than an SVG. `extents` plays the part the SVG
+        viewBox plays elsewhere — it maps cursor position back to sheet
+        inches, so the measure tool keeps working.
+        """
+        self._scene.clear()
+        self._svg_item = None
+        self._svg_renderer = None
+        self._measure_line = None
+        self._measure_dot1 = None
+        self._measure_dot2 = None
+        self._measure_point1 = None
+
+        if not png_data:
+            return False
+
+        self._detail_item = None
+        self._detail_token += 1
+
+        pix = QPixmap()
+        if not pix.loadFromData(QByteArray(png_data), "PNG") or pix.isNull():
+            pix = self._load_downscaled(png_data)
+            if pix is None:
+                # Say so rather than leaving an empty canvas with no
+                # explanation, which is indistinguishable from a bug.
+                return False
+
+        item = QGraphicsPixmapItem(pix)
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._scene.addItem(item)
+        self._svg_item = item
+        self._svg_viewbox = extents
+
+        self._scene.setSceneRect(item.boundingRect())
+        self.fit_to_view()
+        return True
+
     def fit_to_view(self) -> None:
         """Scale so the entire drawing fits in the viewport."""
         if self._svg_item is None:
@@ -121,6 +326,8 @@ class DrawingCanvas(QGraphicsView):
         self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
         # Record actual zoom factor after fitInView
         self._current_zoom = self.transform().m11()
+        self._update_sampling()
+        self._schedule_detail()
 
     def set_pan_mode(self, enabled: bool) -> None:
         """Called by the toolbar Pan button to enable/disable left-click panning."""
@@ -165,6 +372,8 @@ class DrawingCanvas(QGraphicsView):
         if _MIN_ZOOM <= new_zoom <= _MAX_ZOOM:
             self.scale(factor, factor)
             self._current_zoom = new_zoom
+            self._update_sampling()
+            self._schedule_detail()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -209,6 +418,7 @@ class DrawingCanvas(QGraphicsView):
         if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
             if self._pan_origin is not None:
                 self._pan_origin = None
+                self._schedule_detail()      # redraw detail where we landed
                 if self._measure_mode:
                     self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
                 elif self._pan_mode:

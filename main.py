@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPalette, QColor
+from PyQt6.QtGui import QPalette, QColor, QImageReader
 
 from src.main_window import MainWindow
 
@@ -47,6 +47,12 @@ def _apply_dark_palette(app: QApplication) -> None:
 
 
 def main() -> None:
+    # Qt 6 refuses to decode any image larger than 256 MB by default.
+    # A rasterised DWF sheet is 16000 px wide and lands around 375 MB
+    # once expanded, so without this the drawing silently fails to load
+    # and the canvas just shows nothing. 0 removes the ceiling.
+    QImageReader.setAllocationLimit(0)
+
     app = QApplication(sys.argv)
     app.setApplicationName("DWG Viewer")
     app.setOrganizationName("DWGViewer")
@@ -60,7 +66,8 @@ def main() -> None:
         folder = Path(sys.argv[1])
         if folder.is_dir():
             window._browser.open_folder(folder)
-        elif folder.is_file() and folder.suffix.lower() in {".dwg", ".dxf"}:
+        elif folder.is_file() and folder.suffix.lower() in {".dwg", ".dxf",
+                                                           ".dwf", ".dwfx"}:
             window._browser.open_folder(folder.parent)
             window._open_file(str(folder))
 

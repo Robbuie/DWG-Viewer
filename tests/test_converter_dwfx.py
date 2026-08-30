@@ -76,17 +76,23 @@ def test_dwfx_round_trip(tmp_path=None):
 
 
 def test_extension_is_not_trusted(tmp_path=None):
-    """A .dwfx that is really classic DWF gets the classic-DWF message."""
+    """A .dwfx that is really classic DWF takes the raster path, not the
+    DWFx one — the extension is never trusted over the content."""
     tmp = Path(tmp_path or tempfile.mkdtemp())
     fake = tmp / "old.dwfx"
     fake.write_bytes(b"(DWF V06.00)PK\x03\x04" + b"\x00" * 64)
     conv = DWGConverter(fake)
+    conv.load()
+    assert conv.is_raster
+    assert conv.get_layers() == []
+    # ...and this one is a stub with no graphics, so rendering must fail
+    # with a clear error rather than a traceback.
     try:
-        conv.load()
-    except DrawingError as exc:
-        assert "classic DWF" in str(exc)
+        conv.render_raster(64)
+    except DrawingError:
+        pass
     else:
-        raise AssertionError("expected DrawingError")
+        raise AssertionError("expected DrawingError from a bodyless DWF")
 
 
 def test_unknown_type(tmp_path=None):

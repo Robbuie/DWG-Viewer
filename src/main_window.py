@@ -32,18 +32,19 @@ class _GeometryWorker(QThread):
     background, so sharp zooming becomes available a little after the
     drawing itself appears rather than holding it up."""
 
-    ready = pyqtSignal(object)
+    ready = pyqtSignal(object, int)
 
     def __init__(self, conv):
         super().__init__()
         self._conv = conv
+        self._sheet = conv.current_sheet
 
     def run(self):
         try:
             self._conv.ensure_geometry()
         except Exception:
             return
-        self.ready.emit(self._conv)
+        self.ready.emit(self._conv, self._sheet)
 
 
 class _RasterWorker(QThread):
@@ -326,9 +327,10 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # Sheet picker — hidden unless the file holds a drawing set,
-        # which today means a multi-sheet DWFx package.
+        # which means a published set: a multi-sheet DWFx package or a
+        # classic DWF holding more than one plotted sheet.
         self._sheet_box = QComboBox()
-        self._sheet_box.setToolTip("Sheet within this DWFx package")
+        self._sheet_box.setToolTip("Sheet within this drawing set")
         self._sheet_box.setMinimumWidth(140)
         self._sheet_box.setStyleSheet(
             "QComboBox { background: #3a3a3a; color: #ccc; border: 1px solid #555;"
@@ -683,7 +685,12 @@ class MainWindow(QMainWindow):
         return "0"
 
     def _attach_markup(self) -> None:
-        self._canvas.set_markup_context(self._markup_store, self._sheet_key())
+        key = self._sheet_key()
+        conv = self._current_conv
+        if (self._markup_store is not None and conv is not None
+                and conv.is_raster and conv.current_sheet == 0):
+            self._markup_store.rekey_legacy(key)
+        self._canvas.set_markup_context(self._markup_store, key)
         self._sync_markup_actions()
 
     # ------------------------------------------------------------------ #
@@ -738,7 +745,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "DWG, DXF and DWFx drawing viewer.<br>"
+            "DWG, DXF, DWF and DWFx drawing viewer.<br>"
             "DWG/DXF are rendered with ezdxf and DWG conversion uses the "
             "free ODA File Converter; DWFx sheets are read directly from "
             "their XPS package.")
@@ -940,9 +947,9 @@ class MainWindow(QMainWindow):
         self._geometry_worker = worker
         worker.start()
 
-    def _on_geometry_ready(self, conv: DWGConverter) -> None:
-        if conv is not self._current_conv:
-            return          # a different drawing was opened meanwhile
+    def _on_geometry_ready(self, conv: DWGConverter, sheet: int) -> None:
+        if conv is not self._current_conv or sheet != conv.current_sheet:
+            return          # a different drawing or sheet is on screen now
         self._canvas.set_detail_provider(conv.render_detail_png)
         # On a cached open nothing was decoded until now, so this is the
         # first point at which the sheet's layers are known.
@@ -973,8 +980,61 @@ class MainWindow(QMainWindow):
         self._flush_markup()
         conv.set_sheet(index)
         self._layers.populate(conv.get_layers(), conv.layer_note())
+        if conv.is_raster:
+            # The old picture stays up while the new sheet decodes, so
+            # its redlines stay with it; _on_sheet_rendered re-attaches
+            # once the sheet they belong to is actually on screen.
+            self._start_sheet_raster(conv)
+            return
         self._start_render()
         self._attach_markup()
+
+    def _start_sheet_raster(self, conv: DWGConverter) -> None:
+        """Show another sheet of a classic DWF.
+
+        Not the same job as re-applying layers, which keeps everything
+        but the picture: the geometry and the searchable text belong to
+        the sheet that was open, so they are dropped here and rebuilt
+        for the new one once it has been decoded.
+        """
+        for worker in (self._geometry_worker, self._raster_worker):
+            if worker is not None and worker.isRunning():
+                worker.terminate()
+                worker.wait(2000)
+        self._canvas.set_detail_provider(None)
+        self._canvas.set_text_index(None)
+        self._update_find_status()
+
+        cached = conv.has_cached_raster()
+        name = self._sheet_box.currentText() or "this sheet"
+        self._progress.setVisible(True)
+        self.statusBar().showMessage(
+            f"Opening {name} …" if cached else
+            f"Decoding {name} — first open of this sheet, which takes about "
+            f"a minute. Later opens are instant.",
+            4000 if cached else 0)
+
+        worker = _RasterWorker(conv)
+        worker.done.connect(self._on_sheet_rendered)
+        worker.err.connect(lambda msg: (
+            self._progress.setVisible(False),
+            self.statusBar().showMessage(f"Render error: {msg}", 4000)))
+        worker.finished.connect(worker.deleteLater)
+        self._raster_worker = worker
+        worker.start()
+
+    def _on_sheet_rendered(self, conv, png, extents):
+        self._progress.setVisible(False)
+        if conv is not self._current_conv:
+            return          # a different drawing was opened meanwhile
+        if not self._canvas.load_image(png, extents):
+            self.statusBar().showMessage(
+                "That sheet could not be displayed.", 5000)
+            return
+        self._attach_markup()
+        self._canvas.set_paper_inches(conv.paper_size_inches())
+        self._layers.populate(conv.get_layers(), conv.layer_note())
+        self._start_geometry(conv)
 
     def _on_load_error(self, message: str):
         self._progress.setVisible(False)

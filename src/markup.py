@@ -163,6 +163,23 @@ class MarkupStore:
     def set_sheet(self, key: str, items: list[Markup]) -> None:
         self._sheets[key or "0"] = list(items)
 
+    def rekey_legacy(self, key: str) -> None:
+        """Move redlines saved under the old index key onto a named sheet.
+
+        Before the viewer could name a classic DWF's sheets it opened the
+        first one and saved every redline under "0". Those redlines are
+        the first sheet's, so the first time it is opened by name they
+        are carried across rather than vanishing. Only ever done when the
+        named sheet has nothing of its own, so it cannot overwrite work.
+        """
+        if not key or key == "0":
+            return
+        legacy = self._sheets.get("0")
+        if not legacy or self._sheets.get(key):
+            return
+        self._sheets[key] = legacy
+        del self._sheets["0"]
+
     def total(self) -> int:
         return sum(len(v) for v in self._sheets.values())
 

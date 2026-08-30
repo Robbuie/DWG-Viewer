@@ -164,26 +164,41 @@ def raster_variant(hidden) -> str:
     return "." + digest.hexdigest()[:10]
 
 
-def raster_path(filepath: Path, width_px: int, variant: str = "") -> Path:
+def raster_sheet(sheet: int) -> str:
+    """Which sheet of a multi-sheet DWF a raster belongs to.
+
+    A DWF set holds several sheets in one file, each decoding to a
+    different picture, so the sheet has to be part of the key or the
+    second sheet opened would be served the first one's raster. Sheet 0
+    keeps the unsuffixed name, so rasters cached by earlier versions —
+    which only ever decoded the first sheet — stay valid.
+    """
+    return f".s{sheet}" if sheet else ""
+
+
+def raster_path(filepath: Path, width_px: int, variant: str = "",
+                sheet: int = 0) -> Path:
     return (RASTER_DIR /
-            f"{cache_key(filepath)}.w{width_px}{variant}"
+            f"{cache_key(filepath)}.w{width_px}{raster_sheet(sheet)}{variant}"
             f".g{RENDERER_GENERATION}.png")
 
 
-def raster_layers_path(filepath: Path, width_px: int) -> Path:
+def raster_layers_path(filepath: Path, width_px: int, sheet: int = 0) -> Path:
     """The sheet's layer names, cached beside the raster.
 
     Without this a cached open would show no layers at all: the names
     only exist as a by-product of decoding, which is exactly what the
-    cache is there to skip.
+    cache is there to skip. Layers are per sheet, so this is keyed by
+    sheet the same way the raster is.
     """
     return (RASTER_DIR /
-            f"{cache_key(filepath)}.w{width_px}.g{RENDERER_GENERATION}.layers.json")
+            f"{cache_key(filepath)}.w{width_px}{raster_sheet(sheet)}"
+            f".g{RENDERER_GENERATION}.layers.json")
 
 
 def get_cached_raster(filepath: Path, width_px: int,
-                      variant: str = "") -> bytes | None:
-    p = raster_path(filepath, width_px, variant)
+                      variant: str = "", sheet: int = 0) -> bytes | None:
+    p = raster_path(filepath, width_px, variant, sheet)
     try:
         if p.is_file():
             return p.read_bytes()
@@ -193,13 +208,14 @@ def get_cached_raster(filepath: Path, width_px: int,
 
 
 def store_raster(filepath: Path, width_px: int, data: bytes,
-                 variant: str = "") -> None:
+                 variant: str = "", sheet: int = 0) -> None:
     if data:
         _ensure_dirs()
-        _atomic_write(raster_path(filepath, width_px, variant), data)
+        _atomic_write(raster_path(filepath, width_px, variant, sheet), data)
 
 
-def get_cached_raster_layers(filepath: Path, width_px: int) -> list[str] | None:
+def get_cached_raster_layers(filepath: Path, width_px: int,
+                             sheet: int = 0) -> list[str] | None:
     """Layer names for a cached raster, or None if none were recorded.
 
     None means unknown — an empty list means the sheet genuinely declared
@@ -207,7 +223,7 @@ def get_cached_raster_layers(filepath: Path, width_px: int) -> list[str] | None:
     the other a reason to tell the user why the panel is empty.
     """
     try:
-        raw = raster_layers_path(filepath, width_px).read_bytes()
+        raw = raster_layers_path(filepath, width_px, sheet).read_bytes()
         got = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError):
         return None
@@ -215,10 +231,10 @@ def get_cached_raster_layers(filepath: Path, width_px: int) -> list[str] | None:
 
 
 def store_raster_layers(filepath: Path, width_px: int,
-                        layers: list[str]) -> None:
+                        layers: list[str], sheet: int = 0) -> None:
     _ensure_dirs()
     try:
-        _atomic_write(raster_layers_path(filepath, width_px),
+        _atomic_write(raster_layers_path(filepath, width_px, sheet),
                       json.dumps(list(layers)).encode("utf-8"))
     except OSError:
         pass

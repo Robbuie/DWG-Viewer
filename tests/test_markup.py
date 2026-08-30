@@ -151,6 +151,28 @@ def test_sheets_are_keyed_by_name_not_index():
         assert reopened.total() == 2
 
 
+def test_redlines_saved_before_sheets_had_names_are_carried_across():
+    """Classic DWF sheets were unnamed until the viewer could read them,
+    so every redline went under "0". Those belong to the first sheet."""
+    with tempfile.TemporaryDirectory() as tmp:
+        drawing = Path(tmp) / "set.dwf"
+        drawing.write_bytes(b"x")
+        store = mk.MarkupStore(drawing)
+        store.sheet("0").append(
+            mk.Markup(kind=mk.CLOUD, points=[(0.1, 0.1), (0.3, 0.3)]))
+        store.rekey_legacy("Plan")
+        assert store.sheet("Plan")[0].kind == mk.CLOUD
+        assert store.sheets_with_markup() == ["Plan"]
+
+        # Only ever into an empty sheet: work already on the named sheet
+        # is never overwritten, and the old key is left alone.
+        store.sheet("0").append(
+            mk.Markup(kind=mk.BOX, points=[(0.4, 0.4), (0.6, 0.6)]))
+        store.rekey_legacy("Plan")
+        assert store.sheet("Plan")[0].kind == mk.CLOUD
+        assert store.sheet("0")[0].kind == mk.BOX
+
+
 def test_emptying_the_store_removes_the_sidecar():
     with tempfile.TemporaryDirectory() as tmp:
         drawing = Path(tmp) / "plan.dxf"

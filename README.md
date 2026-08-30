@@ -16,9 +16,9 @@ printing to scale, and snapshots to the clipboard.
 Nothing here needs a converter except DWG.
 
 **DWFx** is an XPS/OPC package, so its sheets are read straight out of
-the ZIP with the standard library. A multi-sheet DWFx shows a sheet
-picker in the toolbar, and named Canvas groups appear in the layer panel
-(DWFx has no CAD layer table, so that is the nearest equivalent).
+the ZIP with the standard library. Named Canvas groups appear in the
+layer panel (DWFx has no CAD layer table, so that is the nearest
+equivalent).
 
 **Classic DWF** (version 6 and earlier) stores its geometry as binary
 WHIP!/W2D opcode streams. `src/w2d.py` decodes those and
@@ -34,6 +34,20 @@ formats use, so a classic DWF is handled differently:
   resolution instead of magnifying pixels
 * the folder grid shows the plot preview AutoCAD embeds when publishing,
   so tiles appear immediately without decoding anything
+
+## Sheets
+
+Both DWF flavours can hold a whole published set rather than one
+drawing, so a file with more than one sheet gets a picker in the
+toolbar. The sheets come from the container's manifest, which is cheap
+to read, so the list is there the moment the file opens and only the
+sheet being looked at is ever decoded.
+
+Everything that belongs to a sheet is kept per sheet: its layers, its
+searchable text, its redlines, and — for classic DWF — its cached
+raster, so going back to a sheet already seen is instant rather than
+another minute of decoding. The first sheet of a classic DWF keeps
+redlines drawn before the viewer could read sheet names.
 
 Layers come from the stream's layer opcodes — `(Layer 3 'WALLS')` to
 declare one and either `(Layer 3)` or the binary `0xAC` to re-select it

@@ -224,6 +224,10 @@ class DWGConverter:
         # decoded yet" and an empty list means "this sheet declares none"
         # — the panel says something different for each.
         self._classic_layers: list[str] | None = None
+        # Sheet titles from the DWF manifest. A classic DWF is a whole
+        # published set as often as it is one drawing, and the sheets
+        # are known from the container before anything is decoded.
+        self._classic_sheets: list[str] = []
 
     def load(self) -> None:
         suffix = self.filepath.suffix.lower()
@@ -256,6 +260,8 @@ class DWGConverter:
         if dwfx.is_classic_dwf(self.filepath):
             self._classic = True
             self._layer_vis = {}
+            self._sheet = 0
+            self._classic_sheets = self._read_classic_sheets()
             return
 
         raise DrawingError(
@@ -358,6 +364,35 @@ class DWGConverter:
             return "This drawing defines no layers."
         return None
 
+    def _read_classic_sheets(self) -> list[str]:
+        """Sheet titles from the DWF manifest.
+
+        Reading the container is cheap — it is the opcode streams that
+        are not — so the whole set is listed at open time and only the
+        sheet being looked at is ever decoded. A sheet published without
+        a title still needs something in the picker, so it gets its
+        number.
+        """
+        from src import dwf as classic
+        try:
+            with classic.ClassicDwf(self.filepath) as doc:
+                titles = [(sh.title or sh.name or "").strip()
+                          for sh in doc.sheets]
+        except Exception:
+            return []
+        # Markup and the sheet picker both key off these, so two sheets
+        # published under the same title have to be told apart.
+        names: list[str] = []
+        for i, title in enumerate(titles):
+            name = title or f"Sheet {i + 1}"
+            if name in names:
+                n = 2
+                while f"{name} ({n})" in names:
+                    n += 1
+                name = f"{name} ({n})"
+            names.append(name)
+        return names
+
     def _note_classic_layers(self, layers: list[str]) -> None:
         """Record the layer names a decode pass turned up, keeping any
         visibility the user has already set."""
@@ -408,7 +443,8 @@ class DWGConverter:
         width = width_px or w2d_render.DEFAULT_WIDTH
         variant = _cache.raster_variant(self.hidden_layers())
         try:
-            return _cache.raster_path(self.filepath, width, variant).is_file()
+            return _cache.raster_path(self.filepath, width, variant,
+                                      self._sheet).is_file()
         except OSError:
             return False
 
@@ -424,7 +460,8 @@ class DWGConverter:
         width = width_px or w2d_render.DEFAULT_WIDTH
         hidden = self.hidden_layers()
         variant = _cache.raster_variant(hidden)
-        cached = _cache.get_cached_raster(self.filepath, width, variant)
+        cached = _cache.get_cached_raster(self.filepath, width, variant,
+                                          self._sheet)
         if cached:
             try:
                 from PIL import Image
@@ -435,7 +472,8 @@ class DWGConverter:
                 # from the PNG, so read it back off the stream cheaply.
                 box = self._inches_box(w, h)
                 if box is not None:
-                    known = _cache.get_cached_raster_layers(self.filepath, width)
+                    known = _cache.get_cached_raster_layers(
+                        self.filepath, width, self._sheet)
                     if known is not None:
                         self._note_classic_layers(known)
                     return cached, box
@@ -452,11 +490,12 @@ class DWGConverter:
         if not hidden:
             self._note_classic_layers(layers)
             try:
-                _cache.store_raster_layers(self.filepath, width, layers)
+                _cache.store_raster_layers(self.filepath, width, layers,
+                                           self._sheet)
             except Exception:
                 pass
         try:
-            _cache.store_raster(self.filepath, width, png, variant)
+            _cache.store_raster(self.filepath, width, png, variant, self._sheet)
         except Exception:
             pass
         return png, box
@@ -472,17 +511,26 @@ class DWGConverter:
         """
         if self._geometry is None and self._classic:
             from src import w2d_render
-            self._geometry = w2d_render.decode_geometry(self.filepath, self._sheet)
+            # A decode takes long enough that the user can switch sheets
+            # while it runs. The sheet it was started for is remembered
+            # so a late arrival is dropped rather than handing the new
+            # sheet the old one's geometry and layer names.
+            sheet = self._sheet
+            geometry = w2d_render.decode_geometry(self.filepath, sheet)
+            if sheet != self._sheet:
+                return self._geometry
+            self._geometry = geometry
             # A cached raster skips the decode that would have found the
             # layer names, so this pass is the backstop that fills them in.
             if self._classic_layers is None or (
-                    self._geometry.layers and not self._classic_layers):
-                self._note_classic_layers(self._geometry.layers)
+                    geometry.layers and not self._classic_layers):
+                self._note_classic_layers(geometry.layers)
                 try:
                     from src import cache as _c
                     _c.store_raster_layers(self.filepath,
                                            w2d_render.DEFAULT_WIDTH,
-                                           self._geometry.layers)
+                                           geometry.layers,
+                                           sheet)
                 except Exception:
                     pass
         return self._geometry
@@ -597,16 +645,40 @@ class DWGConverter:
 
     @property
     def sheet_count(self) -> int:
-        return self._dwfx.sheet_count if self._dwfx is not None else 1
+        if self._dwfx is not None:
+            return self._dwfx.sheet_count
+        if self._classic:
+            return max(1, len(self._classic_sheets))
+        return 1
+
+    @property
+    def current_sheet(self) -> int:
+        return self._sheet
 
     def sheet_names(self) -> list[str]:
-        return self._dwfx.sheet_names() if self._dwfx is not None else []
+        if self._dwfx is not None:
+            return self._dwfx.sheet_names()
+        return list(self._classic_sheets) if self._classic else []
 
     def set_sheet(self, index: int) -> None:
-        if self._dwfx is None or not 0 <= index < self._dwfx.sheet_count:
+        if self._dwfx is not None:
+            if not 0 <= index < self._dwfx.sheet_count:
+                return
+            self._sheet = index
+            self._layer_vis = {name: True for name in self._dwfx.layers(index)}
             return
-        self._sheet = index
-        self._layer_vis = {name: True for name in self._dwfx.layers(index)}
+        if self._classic:
+            if not 0 <= index < len(self._classic_sheets) or index == self._sheet:
+                return
+            self._sheet = index
+            # Everything known about the old sheet came out of its opcode
+            # stream — geometry, layer names, which layers were hidden —
+            # and none of it describes the new one. Clearing it puts the
+            # layer panel back to "still decoding" rather than showing
+            # the previous sheet's layers over this one's drawing.
+            self._geometry = None
+            self._classic_layers = None
+            self._layer_vis = {}
 
     @property
     def doc(self): return self._doc

@@ -20,9 +20,12 @@ try:
     from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QBuffer, QIODevice
     from PyQt6.QtGui import QMouseEvent, QPixmap, QPainter, QColor
     from PyQt6.QtWidgets import QApplication
-except ImportError:                                   # pragma: no cover
+except ImportError as exc:                            # pragma: no cover
     import unittest
-    raise unittest.SkipTest("PyQt6 not installed")
+    # Not always a missing PyQt6: on a headless box QtGui needs libEGL,
+    # and saying so is the difference between a skip someone fixes and a
+    # skip everyone reads as "no Qt here, nothing to do".
+    raise unittest.SkipTest(f"Qt unavailable: {exc}")
 
 from src.canvas import DrawingCanvas                  # noqa: E402
 

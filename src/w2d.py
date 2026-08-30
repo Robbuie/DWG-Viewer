@@ -18,6 +18,7 @@ of those would cost more memory than the raster we are building.
 """
 from __future__ import annotations
 
+import re
 import struct
 from array import array
 from typing import Protocol
@@ -54,6 +55,19 @@ class _LazyACI:
 ACI = _LazyACI()
 
 
+# (Layer 3 'WALLS') declares a layer and makes it current; every later
+# reference to the same layer is the bare number, so the name is carried
+# forward. A sheet published without layer information has none of these
+# at all, which is the usual case for AutoCAD's ePlot output.
+_LAYER_RE = re.compile(rb"\(Layer\s+(-?\d+)\s*(?:'((?:[^'\\]|\\.)*)')?", re.I)
+
+
+def layer_label(index: int, name: str) -> str:
+    """What to call a layer in the UI. Only the declaring opcode carries
+    a name, and some producers give none at all."""
+    return name or f"Layer {index}"
+
+
 class UnsupportedOpcode(W2dError):
     def __init__(self, pos: int, byte: int):
         super().__init__(f"unsupported W2D opcode 0x{byte:02x} at offset {pos}")
@@ -72,6 +86,7 @@ class Sink(Protocol):
     def text(self, x: int, y: int, s: str) -> None: ...
     def set_color(self, rgba: tuple[int, int, int, int]) -> None: ...
     def set_visible(self, on: bool) -> None: ...
+    def set_layer(self, index: int, label: str) -> None: ...
 
 
 class GeometryCollector:
@@ -96,7 +111,18 @@ class GeometryCollector:
         self.arc_xyz = array("i")      # cx, cy, r per arc
         self.arc_ang = array("f")      # start, end per arc
         self.arc_col = array("H")
-        self.tri: list[tuple[list, int]] = []   # rare; kept as-is
+        # Layer index per primitive, parallel to the colour arrays. These
+        # stay empty for a sheet published without layer information,
+        # which is most of them, so nothing pays for the feature until a
+        # layer opcode actually turns up.
+        self.seg_layer = array("H")
+        self.pt_layer = array("H")
+        self.arc_layer = array("H")
+        self.layer_names: dict[int, str] = {}
+        self.layer_order: list[int] = []
+        self._layer = 0
+        self._track_layers = False
+        self.tri: list[tuple[list, int, int]] = []   # rare; kept as-is
         # Text opcodes, kept for search. Most lettering on a published
         # ePlot sheet arrives as stroked geometry rather than text, so
         # this is usually a short list — but a title block or a tag that
@@ -125,21 +151,54 @@ class GeometryCollector:
     def set_visible(self, on):
         pass
 
+    # -- layers --------------------------------------------------------
+
+    def set_layer(self, index, label):
+        if index not in self.layer_names:
+            self.layer_order.append(index)
+        self.layer_names[index] = label
+        self._layer = index & 0xFFFF
+        if not self._track_layers:
+            # Everything drawn before the first layer opcode belongs to
+            # no declared layer; backfill it as index 0 so the parallel
+            # arrays stay in step from here on.
+            self._track_layers = True
+            for arr, count in ((self.seg_layer, len(self.seg) // 4),
+                               (self.pt_layer, len(self.pt) // 2),
+                               (self.arc_layer, len(self.arc_xyz) // 3)):
+                arr.frombytes(bytes(arr.itemsize * count))
+
+    @property
+    def has_layers(self) -> bool:
+        return bool(self.layer_names)
+
+    def layers(self) -> list[str]:
+        """Layer labels in the order the sheet declares them."""
+        return [self.layer_names[i] for i in self.layer_order]
+
     # -- geometry ------------------------------------------------------
 
     def _chain(self, pts, close: bool) -> None:
         seg, col = self.seg, self._colour
+        # Bound to a local rather than tested per segment: this loop runs
+        # ten million times on a busy sheet.
+        lay = self.seg_layer if self._track_layers else None
+        layer = self._layer
         prev_x, prev_y = pts[0]
         for x, y in pts[1:]:
             seg.append(prev_x); seg.append(prev_y)
             seg.append(x); seg.append(y)
             self.seg_col.append(col)
+            if lay is not None:
+                lay.append(layer)
             prev_x, prev_y = x, y
         if close and len(pts) > 2:
             fx, fy = pts[0]
             seg.append(prev_x); seg.append(prev_y)
             seg.append(fx); seg.append(fy)
             self.seg_col.append(col)
+            if lay is not None:
+                lay.append(layer)
 
     def polyline(self, pts):
         if len(pts) > 1:
@@ -156,18 +215,24 @@ class GeometryCollector:
 
     def polytriangle(self, pts):
         if len(pts) > 2:
-            self.tri.append((list(pts), self._colour))
+            self.tri.append((list(pts), self._colour, self._layer))
 
     def markers(self, pts):
         pt, col = self.pt, self._colour
+        lay = self.pt_layer if self._track_layers else None
+        layer = self._layer
         for x, y in pts:
             pt.append(x); pt.append(y)
             self.pt_col.append(col)
+            if lay is not None:
+                lay.append(layer)
 
     def arc(self, cx, cy, r, start, end):
         self.arc_xyz.append(cx); self.arc_xyz.append(cy); self.arc_xyz.append(r)
         self.arc_ang.append(start); self.arc_ang.append(end)
         self.arc_col.append(self._colour)
+        if self._track_layers:
+            self.arc_layer.append(self._layer)
 
     def ellipse(self, cx, cy, major, minor, start, end, tilt):
         # Stored as a circle of the larger radius; tilt and eccentricity
@@ -177,6 +242,8 @@ class GeometryCollector:
         self.arc_xyz.append(max(abs(major), abs(minor)))
         self.arc_ang.append(start); self.arc_ang.append(end)
         self.arc_col.append(self._colour)
+        if self._track_layers:
+            self.arc_layer.append(self._layer)
 
     def text(self, x, y, s):
         # Drawn lettering is already stroked geometry, so this adds
@@ -245,7 +312,9 @@ class BoundsSink:
         self._pts([(x, y)])
 
     def set_color(self, rgba): self._tally("color")
+    def set_index(self, index): self._tally("color")
     def set_visible(self, on): self._tally("visibility")
+    def set_layer(self, index, label): self._tally("layer")
 
 
 # ── Font field table ─────────────────────────────────────────────────
@@ -270,6 +339,12 @@ class W2dDecoder:
         self.y = 0
         self.visible = True
         self.color = (0, 0, 0, 255)
+        self.layer = 0
+        self.layer_names: dict[int, str] = {}
+        # Every extended-ASCII token the stream used, counted. Cheap to
+        # keep and the first thing worth looking at when a producer
+        # spells an opcode differently than the files this was built on.
+        self.ascii_tokens: dict[str, int] = {}
 
     # -- primitive readers ---------------------------------------------
 
@@ -347,26 +422,69 @@ class W2dDecoder:
             raise W2dError(f"expected an integer at {start}")
         return i, int(data[start:i])
 
-    def _skip_ascii_opcode(self, i: int) -> int:
-        """'(' Token ... ')' — state we do not act on yet."""
+    def _ascii_opcode(self, i: int) -> tuple[int, str]:
+        """'(' Token ... ')' — returns the end and the leading token.
+
+        Most of these are metadata this viewer has no use for, but the
+        token has to be read rather than skipped past: Layer is one of
+        them, and it is the only place a classic DWF names its layers.
+        """
         data, n = self.data, self.n
         depth = 0
+        name: list[str] = []
+        reading = True
         while i < n:
             c = data[i]
-            if c == 0x27:
+            if c == 0x27:                       # single-quoted string
                 i += 1
                 while i < n and data[i] != 0x27:
-                    i += 1
+                    i += 2 if data[i] == 0x5C else 1
                 i += 1
+                reading = False
                 continue
             if c == 0x28:
                 depth += 1
             elif c == 0x29:
                 depth -= 1
                 if depth == 0:
-                    return i + 1
+                    return i + 1, "".join(name)
+            elif reading:
+                if 33 <= c < 127:
+                    name.append(chr(c))
+                else:
+                    reading = False
             i += 1
         raise W2dError("unterminated ASCII opcode")
+
+    def _layer_opcode(self, body: bytes, sink) -> None:
+        """(Layer <number> ['name']) — declares a layer and makes it
+        current. The name comes with the first mention only; later
+        references are the bare number, so names are carried forward.
+
+        A name given in the Unicode '{...}' string form is not read back
+        here; that layer keeps its numeric label rather than being
+        dropped.
+        """
+        m = _LAYER_RE.match(body)
+        if m is None:
+            return
+        index = int(m.group(1))
+        raw = m.group(2)
+        if raw is not None:
+            out = bytearray()
+            k = 0
+            while k < len(raw):
+                if raw[k] == 0x5C and k + 1 < len(raw):
+                    k += 1
+                out.append(raw[k])
+                k += 1
+            got = out.decode("latin-1").strip()
+            if got:
+                self.layer_names[index] = got
+        self.layer = index
+        setter = getattr(sink, "set_layer", None)
+        if setter is not None:
+            setter(index, layer_label(index, self.layer_names.get(index, "")))
 
     def _skip_ext_binary(self, i: int) -> int:
         size = int.from_bytes(self.data[i + 1:i + 5], "little")
@@ -420,7 +538,11 @@ class W2dDecoder:
                 continue
 
             if b == 0x28:                       # '(' ASCII opcode
-                i = self._skip_ascii_opcode(i)
+                j, token = self._ascii_opcode(i)
+                self.ascii_tokens[token] = self.ascii_tokens.get(token, 0) + 1
+                if token.lower() == "layer":
+                    self._layer_opcode(data[i:j], sink)
+                i = j
                 continue
 
             if b == 0x7B:                       # '{' extended binary

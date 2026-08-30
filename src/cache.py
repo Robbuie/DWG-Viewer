@@ -21,6 +21,7 @@ drawing that cannot be converted is not retried on every visit.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -148,12 +149,41 @@ def store_png(filepath: Path, data: bytes) -> None:
 
 # ── Full-resolution raster cache ──────────────────────────────────────
 
-def raster_path(filepath: Path, width_px: int) -> Path:
-    return RASTER_DIR / f"{cache_key(filepath)}.w{width_px}.g{RENDERER_GENERATION}.png"
+def raster_variant(hidden) -> str:
+    """A short key for one combination of hidden layers.
+
+    Hiding a layer on a classic DWF means decoding the whole sheet again,
+    which is the expensive thing this cache exists to avoid — so each
+    combination gets its own entry and going back to one already seen is
+    instant. The empty set keeps the unsuffixed name so rasters cached by
+    earlier versions stay valid.
+    """
+    if not hidden:
+        return ""
+    digest = hashlib.sha1("\u0000".join(sorted(hidden)).encode("utf-8"))
+    return "." + digest.hexdigest()[:10]
 
 
-def get_cached_raster(filepath: Path, width_px: int) -> bytes | None:
-    p = raster_path(filepath, width_px)
+def raster_path(filepath: Path, width_px: int, variant: str = "") -> Path:
+    return (RASTER_DIR /
+            f"{cache_key(filepath)}.w{width_px}{variant}"
+            f".g{RENDERER_GENERATION}.png")
+
+
+def raster_layers_path(filepath: Path, width_px: int) -> Path:
+    """The sheet's layer names, cached beside the raster.
+
+    Without this a cached open would show no layers at all: the names
+    only exist as a by-product of decoding, which is exactly what the
+    cache is there to skip.
+    """
+    return (RASTER_DIR /
+            f"{cache_key(filepath)}.w{width_px}.g{RENDERER_GENERATION}.layers.json")
+
+
+def get_cached_raster(filepath: Path, width_px: int,
+                      variant: str = "") -> bytes | None:
+    p = raster_path(filepath, width_px, variant)
     try:
         if p.is_file():
             return p.read_bytes()
@@ -162,10 +192,36 @@ def get_cached_raster(filepath: Path, width_px: int) -> bytes | None:
     return None
 
 
-def store_raster(filepath: Path, width_px: int, data: bytes) -> None:
+def store_raster(filepath: Path, width_px: int, data: bytes,
+                 variant: str = "") -> None:
     if data:
         _ensure_dirs()
-        _atomic_write(raster_path(filepath, width_px), data)
+        _atomic_write(raster_path(filepath, width_px, variant), data)
+
+
+def get_cached_raster_layers(filepath: Path, width_px: int) -> list[str] | None:
+    """Layer names for a cached raster, or None if none were recorded.
+
+    None means unknown — an empty list means the sheet genuinely declared
+    no layers, and the two must not be confused: one is a reason to wait,
+    the other a reason to tell the user why the panel is empty.
+    """
+    try:
+        raw = raster_layers_path(filepath, width_px).read_bytes()
+        got = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return [str(x) for x in got] if isinstance(got, list) else None
+
+
+def store_raster_layers(filepath: Path, width_px: int,
+                        layers: list[str]) -> None:
+    _ensure_dirs()
+    try:
+        _atomic_write(raster_layers_path(filepath, width_px),
+                      json.dumps(list(layers)).encode("utf-8"))
+    except OSError:
+        pass
 
 
 def is_known_failure(filepath: Path) -> bool:
@@ -239,8 +295,12 @@ def prune() -> None:
     """
     _ensure_dirs()
     try:
+        # The .layers.json sidecars are a few hundred bytes and are the
+        # only record of a sheet's layer names once its raster is cached,
+        # so they are not worth pruning and are skipped here.
         rasters = [(p.stat().st_mtime, p.stat().st_size, p)
-                   for p in RASTER_DIR.iterdir() if p.is_file()]
+                   for p in RASTER_DIR.iterdir()
+                   if p.is_file() and p.suffix == ".png"]
         total = sum(size for _, size, _ in rasters)
         if total > MAX_RASTER_BYTES:
             rasters.sort()

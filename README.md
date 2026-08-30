@@ -35,8 +35,31 @@ formats use, so a classic DWF is handled differently:
 * the folder grid shows the plot preview AutoCAD embeds when publishing,
   so tiles appear immediately without decoding anything
 
-Layer opcodes are decoded but not yet acted on, so the layer panel is
-empty for classic DWF.
+Layers come from `(Layer …)` opcodes in the stream, which are decoded
+and applied — but most classic DWFs do not have any. AutoCAD only writes
+them when a sheet is published with layer information included, and both
+of the sample sheets this decoder was built against were published
+without it: 430 MB of opcodes between them and not one layer. When a
+sheet has none the layer panel says so rather than sitting empty.
+
+Hiding a layer on a classic DWF means decoding the whole stream again —
+the minute-long job the raster cache exists to avoid — so `R` applies
+layer changes rather than every click doing it, and each combination of
+hidden layers is cached separately. Going back to a combination already
+seen is instant. Deep zoom, which redraws from retained geometry rather
+than the raster, filters layers with no re-decode at all.
+
+## Layers
+
+| Format | Where layers come from |
+|--------|------------------------|
+| `.dxf` / `.dwg` | the CAD layer table, with each layer's colour |
+| `.dwfx` | named Canvas groups — XPS has no layer table |
+| `.dwf` | `(Layer …)` opcodes, when the sheet was published with them |
+
+An empty layer panel always says why it is empty: a DWFx with no named
+groups, a drawing that defines no layers, a classic DWF still decoding,
+or one published without layer information.
 
 ## Running from source
 
@@ -59,7 +82,12 @@ python tests\test_converter_dwfx.py
 python tests\test_navigator.py
 python tests\test_markup.py
 python tests\test_printing.py
+python tests\test_w2d_layers.py
+python tests\test_converter_dwf.py
 ```
+
+Or `pytest tests`, which every file also works as. CI runs the suite on
+every push to `main`; see `.github/workflows/tests.yml`.
 
 The first two run on the standard library alone (they stub ezdxf if it is
 missing) and build their own synthetic DWFx packages, so no sample
@@ -67,8 +95,18 @@ drawings are needed. `test_navigator.py`, `test_markup.py` and
 `test_printing.py` drive the navigator, the panel toggles, the redline
 tools, the snapshot capture, the page-tiling maths and on-sheet search
 through real Qt events on the offscreen platform — printing goes to a
-PDF, so no printer is needed — and they skip themselves if PyQt6 is not
-installed.
+PDF, so no printer is needed — and they skip themselves if Qt cannot be
+loaded, naming the reason (on a headless Linux box it is usually a
+missing `libEGL`, not a missing PyQt6).
+
+`test_w2d_layers.py` builds W2D opcode streams by hand to exercise the
+classic-DWF layer path, because no sample drawing here has layers in it.
+Its decoding tests need only the standard library; the rendering ones
+need numpy and Pillow and skip without them.
+`test_converter_dwf.py` goes the rest of the way: it assembles a real
+DWF 6 container around one of those streams and drives the converter
+through decoding, hiding a layer, and a second open that reads the cache
+instead of decoding again.
 
 ## Diagnostics
 

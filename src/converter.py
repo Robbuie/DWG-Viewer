@@ -219,6 +219,11 @@ class DWGConverter:
         self._classic: bool = False
         self._geometry = None          # decoded W2D geometry, once asked for
         self._sheet: int = 0
+        # Classic DWF names its layers only inside the opcode stream, so
+        # they are not known until a decode pass has run. None means "not
+        # decoded yet" and an empty list means "this sheet declares none"
+        # — the panel says something different for each.
+        self._classic_layers: list[str] | None = None
 
     def load(self) -> None:
         suffix = self.filepath.suffix.lower()
@@ -298,6 +303,11 @@ class DWGConverter:
         self._layer_vis = {l.dxf.name: l.is_on() for l in self._doc.layers}
 
     def get_layers(self) -> list[dict]:
+        if self._classic:
+            # Classic DWF carries no colour per layer, only per primitive.
+            return [{"name": name, "color_index": 7, "color_hex": "#c8c8c8",
+                     "visible": self._layer_vis.get(name, True)}
+                    for name in (self._classic_layers or ())]
         if self._dwfx is not None:
             # DWFx has no CAD layer table; named Canvas groups are the
             # nearest equivalent, and they carry no colour of their own.
@@ -319,6 +329,41 @@ class DWGConverter:
 
     def set_all_layers_visible(self, visible: bool) -> None:
         for n in self._layer_vis: self._layer_vis[n] = visible
+
+    def hidden_layers(self) -> frozenset[str]:
+        return frozenset(n for n, on in self._layer_vis.items() if not on)
+
+    def layer_note(self) -> str | None:
+        """What to tell the user when the layer panel is empty.
+
+        An empty panel with no explanation reads as a broken viewer. Most
+        of the time it means the file simply has no layers in it, and
+        that is worth saying plainly — along with what to do about it.
+        """
+        if self._classic:
+            if self._classic_layers is None:
+                return ("Layers appear once this sheet has finished "
+                        "decoding.")
+            if not self._classic_layers:
+                return ("This DWF was published without layer information, "
+                        "so there are no layers to toggle. Republishing "
+                        "from AutoCAD with layer information included "
+                        "brings them across.")
+            return None
+        if self._dwfx is not None and not self._dwfx.layers(self._sheet):
+            return ("This DWFx has no named groups, which is the nearest "
+                    "thing it has to layers — DWFx keeps no CAD layer "
+                    "table.")
+        if self._doc is not None and not len(self._doc.layers):
+            return "This drawing defines no layers."
+        return None
+
+    def _note_classic_layers(self, layers: list[str]) -> None:
+        """Record the layer names a decode pass turned up, keeping any
+        visibility the user has already set."""
+        self._classic_layers = list(layers)
+        self._layer_vis = {name: self._layer_vis.get(name, True)
+                           for name in layers}
 
     def _render(self, w: int, h: int) -> str:
         assert self._doc
@@ -354,6 +399,19 @@ class DWGConverter:
     def is_raster(self) -> bool:
         return self._classic
 
+    def has_cached_raster(self, width_px: int | None = None) -> bool:
+        """True when the current layer combination is already on disk, so
+        applying it costs nothing rather than a minute of decoding."""
+        if not self._classic:
+            return False
+        from src import w2d_render
+        width = width_px or w2d_render.DEFAULT_WIDTH
+        variant = _cache.raster_variant(self.hidden_layers())
+        try:
+            return _cache.raster_path(self.filepath, width, variant).is_file()
+        except OSError:
+            return False
+
     def render_raster(self, width_px: int | None = None) -> tuple[bytes, tuple]:
         """PNG bytes plus the drawing's extents in sheet inches.
 
@@ -364,7 +422,9 @@ class DWGConverter:
         from src import w2d_render
 
         width = width_px or w2d_render.DEFAULT_WIDTH
-        cached = _cache.get_cached_raster(self.filepath, width)
+        hidden = self.hidden_layers()
+        variant = _cache.raster_variant(hidden)
+        cached = _cache.get_cached_raster(self.filepath, width, variant)
         if cached:
             try:
                 from PIL import Image
@@ -375,16 +435,28 @@ class DWGConverter:
                 # from the PNG, so read it back off the stream cheaply.
                 box = self._inches_box(w, h)
                 if box is not None:
+                    known = _cache.get_cached_raster_layers(self.filepath, width)
+                    if known is not None:
+                        self._note_classic_layers(known)
                     return cached, box
             except Exception:
                 pass
 
         try:
-            png, box = w2d_render.render_sheet_png(self.filepath, self._sheet, width)
+            png, box, layers = w2d_render.render_sheet_png(
+                self.filepath, self._sheet, width, hidden)
         except Exception as exc:
             raise DrawingError(f"Could not decode this DWF sheet: {exc}") from exc
+        # A pass with layers hidden only reports the layers it drew, so
+        # the full list is recorded from the unfiltered pass alone.
+        if not hidden:
+            self._note_classic_layers(layers)
+            try:
+                _cache.store_raster_layers(self.filepath, width, layers)
+            except Exception:
+                pass
         try:
-            _cache.store_raster(self.filepath, width, png)
+            _cache.store_raster(self.filepath, width, png, variant)
         except Exception:
             pass
         return png, box
@@ -401,6 +473,18 @@ class DWGConverter:
         if self._geometry is None and self._classic:
             from src import w2d_render
             self._geometry = w2d_render.decode_geometry(self.filepath, self._sheet)
+            # A cached raster skips the decode that would have found the
+            # layer names, so this pass is the backstop that fills them in.
+            if self._classic_layers is None or (
+                    self._geometry.layers and not self._classic_layers):
+                self._note_classic_layers(self._geometry.layers)
+                try:
+                    from src import cache as _c
+                    _c.store_raster_layers(self.filepath,
+                                           w2d_render.DEFAULT_WIDTH,
+                                           self._geometry.layers)
+                except Exception:
+                    pass
         return self._geometry
 
     @property
@@ -436,7 +520,8 @@ class DWGConverter:
         if out_w < 2 or out_h < 2:
             return b""
         img = geom.render_region(region, out_w, out_h,
-                                 max_segments=MAX_DETAIL_SEGMENTS)
+                                 max_segments=MAX_DETAIL_SEGMENTS,
+                                 hidden=self.hidden_layers())
         if img is None:
             return b""      # too much in view to be worth redrawing
         buf = _io.BytesIO()

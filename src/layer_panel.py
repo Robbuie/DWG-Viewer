@@ -85,15 +85,15 @@ class LayerPanel(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
 
-        show_all = QPushButton("Show All")
-        show_all.setStyleSheet(self._btn_style())
-        show_all.clicked.connect(lambda: self._toggle_all(True))
-        btn_row.addWidget(show_all)
+        self._show_all = QPushButton("Show All")
+        self._show_all.setStyleSheet(self._btn_style())
+        self._show_all.clicked.connect(lambda: self._toggle_all(True))
+        btn_row.addWidget(self._show_all)
 
-        hide_all = QPushButton("Hide All")
-        hide_all.setStyleSheet(self._btn_style())
-        hide_all.clicked.connect(lambda: self._toggle_all(False))
-        btn_row.addWidget(hide_all)
+        self._hide_all = QPushButton("Hide All")
+        self._hide_all.setStyleSheet(self._btn_style())
+        self._hide_all.clicked.connect(lambda: self._toggle_all(False))
+        btn_row.addWidget(self._hide_all)
 
         outer.addLayout(btn_row)
 
@@ -115,6 +115,18 @@ class LayerPanel(QWidget):
         self._container_layout = QVBoxLayout(self._container)
         self._container_layout.setContentsMargins(0, 0, 0, 0)
         self._container_layout.setSpacing(1)
+        # Shown in place of the list when there are no layers. An empty
+        # panel on its own reads as a bug; the usual cause is a file that
+        # simply has no layers in it, which is worth saying.
+        self._note = QLabel()
+        self._note.setWordWrap(True)
+        self._note.setStyleSheet(
+            "color: #999; font-size: 11px; padding: 6px 4px;"
+        )
+        self._note.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._note.hide()
+        self._container_layout.addWidget(self._note)
+
         self._container_layout.addStretch()
 
         scroll.setWidget(self._container)
@@ -127,7 +139,7 @@ class LayerPanel(QWidget):
     #  Public API
     # ------------------------------------------------------------------ #
 
-    def populate(self, layers: list[dict]) -> None:
+    def populate(self, layers: list[dict], note: str | None = None) -> None:
         """
         Replace the layer list.
 
@@ -135,6 +147,8 @@ class LayerPanel(QWidget):
         ----------
         layers : list of {name, color_hex, visible} dicts
                  (as returned by DWGConverter.get_layers())
+        note   : what to show instead when the list is empty — why this
+                 drawing has no layers, rather than a blank panel.
         """
         # Clear existing rows
         for row in self._rows.values():
@@ -142,7 +156,14 @@ class LayerPanel(QWidget):
             row.deleteLater()
         self._rows.clear()
 
-        if not layers:
+        has_layers = bool(layers)
+        self._show_all.setEnabled(has_layers)
+        self._hide_all.setEnabled(has_layers)
+        shown = "" if has_layers else (note or "")
+        self._note.setText(shown)
+        self._note.setVisible(bool(shown))
+
+        if not has_layers:
             return
 
         # Re-insert rows before the stretch
@@ -169,6 +190,17 @@ class LayerPanel(QWidget):
 
     def clear(self) -> None:
         self.populate([])
+
+    @property
+    def note(self) -> str:
+        """The empty-state message currently shown, or "".
+
+        Read off the text rather than the widget's visibility: a panel
+        that has never been shown reports every child as invisible, so
+        isVisible() here would only ever be a test of whether the window
+        is open.
+        """
+        return self._note.text()
 
     # ------------------------------------------------------------------ #
     #  Internal helpers

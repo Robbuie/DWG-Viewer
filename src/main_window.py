@@ -46,11 +46,35 @@ class _GeometryWorker(QThread):
         self.ready.emit(self._conv)
 
 
+class _RasterWorker(QThread):
+    """Re-rasterises a classic DWF with layers hidden.
+
+    Separate from _LoadWorker because nothing else about the drawing
+    changes: the markup, the sheet and the text index all stay as they
+    are, and only the picture is replaced.
+    """
+
+    done = pyqtSignal(object, object, object)
+    err = pyqtSignal(str)
+
+    def __init__(self, conv):
+        super().__init__()
+        self._conv = conv
+
+    def run(self):
+        try:
+            png, extents = self._conv.render_raster()
+        except Exception as exc:
+            self.err.emit(str(exc))
+            return
+        self.done.emit(self._conv, png, extents)
+
+
 class _LoadSignals(QObject):
     # converter, layers, svg, png bytes, extents, text index — a drawing
     # arrives as one or the other: vector formats as SVG, classic DWF as
     # a raster.
-    finished = pyqtSignal(object, list, str, object, object, object)
+    finished = pyqtSignal(object, list, str, object, object, object, str)
     error = pyqtSignal(str)
 
 
@@ -65,16 +89,23 @@ class _LoadWorker(QThread):
         try:
             conv = DWGConverter(self.filepath)
             conv.load()
-            layers = conv.get_layers()
             if conv.is_raster:
+                # Rendered before the layers are asked for: classic DWF
+                # names its layers inside the opcode stream, so they are
+                # a by-product of the decode rather than something that
+                # can be read up front.
                 png, extents = conv.render_raster()
                 # Classic DWF has no text until the geometry pass runs,
                 # which happens after the drawing is already on screen.
-                self.signals.finished.emit(conv, layers, "", png, extents, None)
+                self.signals.finished.emit(conv, conv.get_layers(), "", png,
+                                           extents, None,
+                                           conv.layer_note() or "")
             else:
+                layers = conv.get_layers()
                 svg = conv.render_svg()
                 index = conv.build_text_index(svg)
-                self.signals.finished.emit(conv, layers, svg, None, None, index)
+                self.signals.finished.emit(conv, layers, svg, None, None,
+                                           index, conv.layer_note() or "")
         except DrawingError as exc:
             self.signals.error.emit(str(exc))
         except Exception as exc:
@@ -94,6 +125,8 @@ class MainWindow(QMainWindow):
         self._current_conv: DWGConverter | None = None
         self._load_worker: _LoadWorker | None = None
         self._geometry_worker: _GeometryWorker | None = None
+        self._raster_worker: _RasterWorker | None = None
+        self._render_worker = None
 
         self._markup_store: mk.MarkupStore | None = None
         self._markup_warned_fallback = False
@@ -824,6 +857,8 @@ class MainWindow(QMainWindow):
     def _open_file(self, filepath: str):
         if self._load_worker and self._load_worker.isRunning():
             self._load_worker.terminate()
+        if self._raster_worker and self._raster_worker.isRunning():
+            self._raster_worker.terminate()
 
         # Anything still pending for the previous drawing goes to disk
         # before its store is replaced.
@@ -862,10 +897,11 @@ class MainWindow(QMainWindow):
         return f"Loading: {name} …"
 
     def _on_load_finished(self, conv: DWGConverter, layers: list, svg: str,
-                          png=None, extents=None, text_index=None):
+                          png=None, extents=None, text_index=None,
+                          layer_note: str = ""):
         self._current_conv = conv
         self._populate_sheets(conv)
-        self._layers.populate(layers)
+        self._layers.populate(layers, layer_note or None)
         self._canvas.set_detail_provider(None)
         if png:
             if not self._canvas.load_image(png, extents):
@@ -885,6 +921,8 @@ class MainWindow(QMainWindow):
         self._update_find_status()
         name = conv.filepath.name
         detail = "rasterised" if png else f"{len(layers)} layers"
+        if png and layers:
+            detail = f"rasterised, {len(layers)} layers"
         self._file_label.setText(f"{name}  ({detail})")
         self._progress.setVisible(False)
 
@@ -906,6 +944,9 @@ class MainWindow(QMainWindow):
         if conv is not self._current_conv:
             return          # a different drawing was opened meanwhile
         self._canvas.set_detail_provider(conv.render_detail_png)
+        # On a cached open nothing was decoded until now, so this is the
+        # first point at which the sheet's layers are known.
+        self._layers.populate(conv.get_layers(), conv.layer_note())
         self._canvas.set_text_index(conv.build_text_index())
         self._update_find_status()
         found = self._canvas.text_index_size()
@@ -931,7 +972,7 @@ class MainWindow(QMainWindow):
             return
         self._flush_markup()
         conv.set_sheet(index)
-        self._layers.populate(conv.get_layers())
+        self._layers.populate(conv.get_layers(), conv.layer_note())
         self._start_render()
         self._attach_markup()
 
@@ -949,7 +990,8 @@ class MainWindow(QMainWindow):
         if self._current_conv is None:
             return
         if self._current_conv.is_raster:
-            return          # a raster has no layer state to re-apply
+            self._start_raster_render()
+            return
         self._progress.setVisible(True)
 
         class _RenderWorker(QThread):
@@ -981,6 +1023,59 @@ class MainWindow(QMainWindow):
         w.finished.connect(w.deleteLater)
         self._render_worker = w
         w.start()
+
+    def _start_raster_render(self):
+        """Redraw a classic DWF with the current layers hidden.
+
+        There is no cheap way to do this: hiding a layer means decoding
+        the whole opcode stream again, which is the minute-long job the
+        raster cache exists to avoid. Each combination of hidden layers
+        is cached separately, so it is paid once and going back to a
+        combination already seen is instant.
+        """
+        conv = self._current_conv
+        if conv is None or not conv.is_raster:
+            return
+        if not conv.get_layers():
+            self.statusBar().showMessage(
+                "This DWF has no layers to apply.", 4000)
+            return
+        if self._raster_worker is not None and self._raster_worker.isRunning():
+            return          # one decode at a time; it is expensive enough
+
+        hidden = conv.hidden_layers()
+        cached = conv.has_cached_raster()
+        self._progress.setVisible(True)
+        self.statusBar().showMessage(
+            "Applying layers …" if cached else
+            "Applying layers — this sheet is being decoded again, which "
+            "takes a minute. The result is cached, so this combination "
+            "is instant next time.",
+            0 if not cached else 4000)
+
+        worker = _RasterWorker(conv)
+        worker.done.connect(self._on_raster_rendered)
+        worker.err.connect(lambda msg: (
+            self._progress.setVisible(False),
+            self.statusBar().showMessage(f"Render error: {msg}", 4000)))
+        worker.finished.connect(worker.deleteLater)
+        self._raster_worker = worker
+        worker.start()
+
+    def _on_raster_rendered(self, conv, png, extents):
+        self._progress.setVisible(False)
+        if conv is not self._current_conv:
+            return          # a different drawing was opened meanwhile
+        if not self._canvas.load_image(png, extents):
+            self.statusBar().showMessage(
+                "The redrawn sheet could not be displayed.", 5000)
+            return
+        self._attach_markup()
+        self._canvas.set_paper_inches(conv.paper_size_inches())
+        hidden = len(conv.hidden_layers())
+        self.statusBar().showMessage(
+            f"{hidden} layer{'s' if hidden != 1 else ''} hidden."
+            if hidden else "All layers shown.", 4000)
 
     def _flush_markup(self) -> None:
         """Write pending redlines now rather than on the timer."""

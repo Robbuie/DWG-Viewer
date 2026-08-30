@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw
 Image.MAX_IMAGE_PIXELS = None
 
 from src import dwf as classic
-from src.w2d import W2dDecoder
+from src.w2d import W2dDecoder, layer_label
 
 # Resolution of the cached raster. On a 36x24 sheet this is ~460 dpi,
 # which puts 0.1-inch drawing text at 46 pixels tall — comfortably
@@ -113,17 +113,25 @@ class RasterSink:
     """Draws decoded primitives into a Pillow image."""
 
     def __init__(self, draw: ImageDraw.ImageDraw, x0: int, y0: int,
-                 scale: float, height_px: int):
+                 scale: float, height_px: int,
+                 hidden: frozenset[str] = frozenset()):
         self.d = draw
         self.x0, self.y0, self.s, self.h = x0, y0, scale, height_px
         self.colour: tuple[int, int, int] = (0, 0, 0)
         self.drawn = 0
+        # Hidden layers are named rather than numbered because that is
+        # what the panel hands back; the decoder resolves the number to
+        # its label before it gets here.
+        self.hidden = hidden
+        self.skip = False
 
     def _map(self, pts):
         s, x0, y0, h = self.s, self.x0, self.y0, self.h
         return [(int((x - x0) * s), h - int((y - y0) * s)) for x, y in pts]
 
     def polyline(self, pts):
+        if self.skip:
+            return
         p = self._map(pts)
         if len(p) > 1:
             self.d.line(p, fill=self.colour, width=1)
@@ -134,23 +142,31 @@ class RasterSink:
         # sheets leave off — so an OPEN polyline. Neither filling it nor
         # closing it is right: filling produced black blobs, and closing
         # drew a spurious stroke across every character of every label.
+        if self.skip:
+            return
         p = self._map(pts)
         if len(p) > 1:
             self.d.line(p, fill=self.colour, width=1)
             self.drawn += 1
 
     def polytriangle(self, pts):
+        if self.skip:
+            return
         p = self._map(pts)
         for k in range(len(p) - 2):
             self.d.polygon(p[k:k + 3], fill=self.colour)
         self.drawn += 1
 
     def markers(self, pts):
+        if self.skip:
+            return
         for xy in self._map(pts):
             self.d.point(xy, fill=self.colour)
         self.drawn += 1
 
     def arc(self, cx, cy, r, start, end):
+        if self.skip:
+            return
         (px, py), = self._map([(cx, cy)])
         rp = max(1, int(r * self.s))
         try:
@@ -161,6 +177,8 @@ class RasterSink:
             pass          # degenerate box — nothing to draw
 
     def ellipse(self, cx, cy, major, minor, start, end, tilt):
+        if self.skip:
+            return
         (px, py), = self._map([(cx, cy)])
         a = max(1, int(abs(major) * self.s))
         b = max(1, int(abs(minor) * self.s))
@@ -186,14 +204,22 @@ class RasterSink:
     def set_visible(self, on):
         pass
 
+    def set_layer(self, index, label):
+        self.skip = label in self.hidden
 
-def render_sheet(path, index: int = 0, width_px: int = DEFAULT_WIDTH):
-    """Decode one sheet of a classic DWF and return (image, inches_box).
+
+def render_sheet(path, index: int = 0, width_px: int = DEFAULT_WIDTH,
+                 hidden: frozenset[str] = frozenset()):
+    """Decode one sheet of a classic DWF and return
+    (image, inches_box, layers).
 
     inches_box is (0, height_in, width_in, -height_in): the drawing's
     extents in sheet inches, with a negative height because raster rows
     run downward while drawing coordinates run up. The canvas maps
     cursor position through it, so measurements come out in inches.
+
+    layers is the labels the sheet declared, in declaration order, and is
+    empty for a sheet published without layer information.
     """
     with classic.ClassicDwf(path) as doc:
         stream = doc.graphics_stream(index)
@@ -212,13 +238,15 @@ def render_sheet(path, index: int = 0, width_px: int = DEFAULT_WIDTH):
     scale = width_px / (x1 - x0)
     height_px = max(1, int((y1 - y0) * scale))
     img = Image.new("RGB", (width_px, height_px), (255, 255, 255))
-    sink = RasterSink(ImageDraw.Draw(img), x0, y0, scale, height_px)
-    W2dDecoder(stream).run(sink)
+    sink = RasterSink(ImageDraw.Draw(img), x0, y0, scale, height_px, hidden)
+    decoder = W2dDecoder(stream)
+    decoder.run(sink)
+    layers = [layer_label(i, n) for i, n in decoder.layer_names.items()]
 
     per_unit = read_inches_per_unit(stream)
     width_in = (x1 - x0) * per_unit
     height_in = (y1 - y0) * per_unit
-    return img, (0.0, height_in, width_in, -height_in)
+    return img, (0.0, height_in, width_in, -height_in), layers
 
 
 # ── On-demand rendering from retained geometry ───────────────────────
@@ -239,6 +267,8 @@ class SheetGeometry:
         self.palette = collector.palette
         self.tri = collector.tri
         self.texts = list(getattr(collector, "texts", ()))
+        self.layer_names = dict(collector.layer_names)
+        self.layers = collector.layers()
 
         self.seg = np.frombuffer(collector.seg, dtype=np.int32).reshape(-1, 4)
         self.seg_col = np.frombuffer(collector.seg_col, dtype=np.uint16)
@@ -248,13 +278,29 @@ class SheetGeometry:
         self.arc_ang = np.frombuffer(collector.arc_ang, dtype=np.float32).reshape(-1, 2)
         self.arc_col = np.frombuffer(collector.arc_col, dtype=np.uint16)
 
+        # Empty unless the sheet declared layers, in which case these run
+        # parallel to the colour arrays above.
+        self.seg_layer = np.frombuffer(collector.seg_layer, dtype=np.uint16)
+        self.pt_layer = np.frombuffer(collector.pt_layer, dtype=np.uint16)
+        self.arc_layer = np.frombuffer(collector.arc_layer, dtype=np.uint16)
+
+    def _hidden_indices(self, hidden) -> np.ndarray | None:
+        """The layer numbers behind a set of hidden layer labels, or None
+        when there is nothing to filter."""
+        if not hidden or not self.layer_names or not self.seg_layer.size:
+            return None
+        nums = [i for i, label in self.layer_names.items() if label in hidden]
+        return np.array(nums, dtype=np.uint16) if nums else None
+
     @property
     def nbytes(self) -> int:
         return (self.seg.nbytes + self.seg_col.nbytes + self.pt.nbytes
                 + self.pt_col.nbytes + self.arc.nbytes + self.arc_ang.nbytes)
 
     def render_region(self, region, width_px: int, height_px: int,
-                      max_segments: int | None = None) -> Image.Image | None:
+                      max_segments: int | None = None,
+                      hidden: frozenset[str] = frozenset()
+                      ) -> Image.Image | None:
         """Draw the logical rectangle `region` into an image of the given
         pixel size. Only primitives overlapping the region are touched.
 
@@ -271,6 +317,7 @@ class SheetGeometry:
 
         sx = width_px / (rx1 - rx0)
         sy = height_px / (ry1 - ry0)
+        drop = self._hidden_indices(hidden)
         img = Image.new("RGB", (width_px, height_px), (255, 255, 255))
         draw = ImageDraw.Draw(img)
         palette = self.palette
@@ -280,10 +327,13 @@ class SheetGeometry:
         # trade for a drawing this size.
         ax, ay = self.seg[:, 0], self.seg[:, 1]     # not sx/sy: those are
         bx, by = self.seg[:, 2], self.seg[:, 3]     # the scale factors above
-        hit = np.flatnonzero((np.minimum(ax, bx) <= rx1)
-                             & (np.maximum(ax, bx) >= rx0)
-                             & (np.minimum(ay, by) <= ry1)
-                             & (np.maximum(ay, by) >= ry0))
+        keep_seg = ((np.minimum(ax, bx) <= rx1)
+                    & (np.maximum(ax, bx) >= rx0)
+                    & (np.minimum(ay, by) <= ry1)
+                    & (np.maximum(ay, by) >= ry0))
+        if drop is not None:
+            keep_seg &= ~np.isin(self.seg_layer, drop)
+        hit = np.flatnonzero(keep_seg)
         if max_segments is not None and hit.size > max_segments:
             return None
 
@@ -300,8 +350,11 @@ class SheetGeometry:
 
         if self.pt.size:
             pts = self.pt
-            keep = np.flatnonzero((pts[:, 0] >= rx0) & (pts[:, 0] <= rx1)
-                                  & (pts[:, 1] >= ry0) & (pts[:, 1] <= ry1))
+            keep_pt = ((pts[:, 0] >= rx0) & (pts[:, 0] <= rx1)
+                       & (pts[:, 1] >= ry0) & (pts[:, 1] <= ry1))
+            if drop is not None and self.pt_layer.size == pts.shape[0]:
+                keep_pt &= ~np.isin(self.pt_layer, drop)
+            keep = np.flatnonzero(keep_pt)
             if keep.size:
                 chosen = pts[keep]
                 px = ((chosen[:, 0] - rx0) * sx).astype(np.int32)
@@ -313,9 +366,12 @@ class SheetGeometry:
 
         if self.arc.size:
             arcs = self.arc
-            keep = np.flatnonzero(
+            keep_arc = (
                 (arcs[:, 0] + arcs[:, 2] >= rx0) & (arcs[:, 0] - arcs[:, 2] <= rx1)
                 & (arcs[:, 1] + arcs[:, 2] >= ry0) & (arcs[:, 1] - arcs[:, 2] <= ry1))
+            if drop is not None and self.arc_layer.size == arcs.shape[0]:
+                keep_arc &= ~np.isin(self.arc_layer, drop)
+            keep = np.flatnonzero(keep_arc)
             for k in keep:
                 cx, cy, r = arcs[k]
                 start, end = self.arc_ang[k]
@@ -329,7 +385,9 @@ class SheetGeometry:
                 except ValueError:
                     pass
 
-        for pts, colour in self.tri:
+        for pts, colour, layer in self.tri:
+            if drop is not None and layer in drop:
+                continue
             mapped = [(int((x - rx0) * sx), int(height_px - (y - ry0) * sy))
                       for x, y in pts]
             for k in range(len(mapped) - 2):
@@ -356,9 +414,10 @@ def decode_geometry(path, index: int = 0) -> SheetGeometry:
     return SheetGeometry(collector, view, read_inches_per_unit(stream))
 
 
-def render_sheet_png(path, index: int = 0,
-                     width_px: int = DEFAULT_WIDTH) -> tuple[bytes, tuple]:
-    img, inches_box = render_sheet(path, index, width_px)
+def render_sheet_png(path, index: int = 0, width_px: int = DEFAULT_WIDTH,
+                     hidden: frozenset[str] = frozenset()
+                     ) -> tuple[bytes, tuple, list[str]]:
+    img, inches_box, layers = render_sheet(path, index, width_px, hidden)
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=False)
-    return buf.getvalue(), inches_box
+    return buf.getvalue(), inches_box, layers

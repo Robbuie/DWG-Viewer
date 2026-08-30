@@ -8,18 +8,22 @@ from __future__ import annotations
 import math
 import re
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSize, pyqtSignal, QTimer, QThread, QObject
+from PyQt6.QtCore import (Qt, QRect, QRectF, QPoint, QPointF, QSize,
+                          pyqtSignal, QTimer, QThread, QObject)
 from PyQt6.QtGui import (
     QWheelEvent, QMouseEvent, QKeyEvent, QPainter,
     QPen, QColor, QCursor, QTransform, QPixmap, QImage, QImageReader,
+    QGuiApplication,
 )
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsLineItem,
-                             QGraphicsEllipseItem, QGraphicsPixmapItem)
+                             QGraphicsEllipseItem, QGraphicsPixmapItem,
+                             QGraphicsItem, QRubberBand, QInputDialog)
 from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
 
 from src.navigator import NavigatorOverlay
+from src import markup as mk
 
 
 class _DetailWorker(QThread):
@@ -70,6 +74,10 @@ class DrawingCanvas(QGraphicsView):
     measurementDone = pyqtSignal(float, float, float, float, float)
     pageNavigateRequested = pyqtSignal(int)   # +1 = next file, -1 = previous file
     navigatorVisibilityChanged = pyqtSignal(bool)
+    markupChanged = pyqtSignal()             # something was added/moved/removed
+    markupToolFinished = pyqtSignal()        # a one-shot tool used itself up
+    snapshotTaken = pyqtSignal(int, int)     # width, height in pixels
+    statusMessage = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -134,6 +142,23 @@ class DrawingCanvas(QGraphicsView):
         self.horizontalScrollBar().valueChanged.connect(self._update_navigator_view)
         self.verticalScrollBar().valueChanged.connect(self._update_navigator_view)
 
+        # Markup (redlines)
+        self._mk_store: "mk.MarkupStore | None" = None
+        self._mk_key = "0"
+        self._mk_items: dict[str, QGraphicsItem] = {}
+        self._mk_origin: dict[str, QPointF] = {}
+        self._mk_tool: str | None = None      # None | 'select' | a mk.KIND
+        self._mk_color = mk.DEFAULT_COLOR
+        self._mk_visible = True
+        self._mk_undo: list[tuple] = []
+        self._draft_item: QGraphicsItem | None = None
+        self._draft_points: list[QPointF] = []
+
+        # Snapshot to clipboard
+        self._snap_mode = False
+        self._snap_origin: QPointF | None = None
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+
     # ------------------------------------------------------------------ #
     #  Public API
     # ------------------------------------------------------------------ #
@@ -169,6 +194,7 @@ class DrawingCanvas(QGraphicsView):
         self._scene.setSceneRect(item.boundingRect())
         self.fit_to_view()
         self._refresh_navigator()
+        self._rebuild_markup()
 
     @staticmethod
     def _load_downscaled(png_data: bytes) -> QPixmap | None:
@@ -332,6 +358,7 @@ class DrawingCanvas(QGraphicsView):
         self._scene.setSceneRect(item.boundingRect())
         self.fit_to_view()
         self._refresh_navigator()
+        self._rebuild_markup()
         return True
 
     def fit_to_view(self) -> None:
@@ -377,6 +404,10 @@ class DrawingCanvas(QGraphicsView):
         self._svg_viewbox = None
         self._nav.set_drawing(None, QRectF())
         self._nav.hide()
+        self._mk_items.clear()
+        self._mk_origin.clear()
+        self._draft_item = None
+        self._draft_points = []
         self._measure_point1 = None
         self._measure_line = None
         self._measure_dot1 = None
@@ -524,6 +555,18 @@ class DrawingCanvas(QGraphicsView):
             self._update_navigator_view()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._snap_mode):
+            self._snap_press(event)
+            return
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._mk_tool in mk.KINDS):
+            self._markup_press(event)
+            return
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._mk_tool == 'select'):
+            super().mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             # Start pan with middle button
             self._pan_origin = event.position()
@@ -549,6 +592,12 @@ class DrawingCanvas(QGraphicsView):
         dx, dy = self._scene_to_drawing(scene_pt)
         self.coordChanged.emit(dx, dy)
 
+        if self._snap_origin is not None:
+            self._snap_move(event)
+            return
+        if self._draft_points:
+            self._markup_move(event)
+            return
         if self._pan_origin is not None:
             delta = event.position() - self._pan_origin
             self._pan_origin = event.position()
@@ -564,6 +613,16 @@ class DrawingCanvas(QGraphicsView):
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._snap_origin is not None:
+            self._snap_release(event)
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._draft_points:
+            self._markup_release(event)
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._mk_tool == 'select':
+            super().mouseReleaseEvent(event)
+            self._sync_moved_markup()
+            return
         if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
             if self._pan_origin is not None:
                 self._pan_origin = None
@@ -580,6 +639,17 @@ class DrawingCanvas(QGraphicsView):
         if event.key() == Qt.Key.Key_Escape:
             self._measure_point1 = None
             self._clear_measure_graphics()
+            self._cancel_draft()
+            if self._snap_mode:
+                self.set_snapshot_mode(False)
+            if self._mk_tool is not None:
+                self.set_markup_tool(None)
+                self.markupToolFinished.emit()
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.delete_selected_markup()
+        elif (event.key() == Qt.Key.Key_Z
+              and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.undo_markup()
         elif event.key() == Qt.Key.Key_F:
             self.fit_to_view()
         elif event.key() in (Qt.Key.Key_Right, Qt.Key.Key_Down):
@@ -588,6 +658,394 @@ class DrawingCanvas(QGraphicsView):
             self.pageNavigateRequested.emit(-1)
         else:
             super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------ #
+    #  Markup (redlines)
+    # ------------------------------------------------------------------ #
+
+    def set_markup_context(self, store, sheet_key: str) -> None:
+        """Attach the store this drawing's redlines live in.
+
+        Called on every open and on every sheet change; passing None
+        detaches, which is what happens when no file is loaded.
+        """
+        self._mk_store = store
+        self._mk_key = sheet_key or "0"
+        self._rebuild_markup()
+
+    def _clear_markup_items(self) -> None:
+        for item in self._mk_items.values():
+            try:
+                if item.scene() is self._scene:
+                    self._scene.removeItem(item)
+            except RuntimeError:
+                pass            # the scene was cleared out from under it
+        self._mk_items.clear()
+        self._mk_origin.clear()
+
+    def _rebuild_markup(self) -> None:
+        """Recreate every markup item from the store.
+
+        Redlines are stored as fractions of the sheet, so this is also
+        what keeps them in place when a drawing is re-rendered at a
+        different size after a layer toggle.
+        """
+        self._clear_markup_items()
+        self._cancel_draft()
+        store = self._mk_store
+        if store is None or self._svg_item is None:
+            return
+        content = self._content_rect()
+        if content.isEmpty():
+            return
+        for m in store.sheet(self._mk_key):
+            item = mk.build_item(m, content)
+            if item is None:
+                continue
+            item.setZValue(20)
+            item.setData(0, m.id)
+            item.setVisible(self._mk_visible)
+            self._scene.addItem(item)
+            self._mk_items[m.id] = item
+            self._mk_origin[m.id] = item.pos()
+        self._apply_selectable(self._mk_tool == 'select')
+
+    def _apply_selectable(self, on: bool) -> None:
+        for item in self._mk_items.values():
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, on)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, on)
+            if not on:
+                item.setSelected(False)
+
+    # -- tool state --------------------------------------------------- #
+
+    def set_markup_tool(self, tool: str | None) -> None:
+        self._cancel_draft()
+        self._mk_tool = tool
+        self._apply_selectable(tool == 'select')
+        if tool in mk.KINDS:
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+            if not self._mk_visible:
+                self.set_markup_visible(True)   # drawing into hidden
+                                                # markup would baffle
+        elif tool == 'select':
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        elif self._pan_mode:
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+    def markup_tool(self) -> str | None:
+        return self._mk_tool
+
+    def set_markup_color(self, color: str) -> None:
+        self._mk_color = color or mk.DEFAULT_COLOR
+
+    def markup_color(self) -> str:
+        return self._mk_color
+
+    def set_markup_visible(self, visible: bool) -> None:
+        self._mk_visible = bool(visible)
+        for item in self._mk_items.values():
+            item.setVisible(self._mk_visible)
+
+    def markup_visible(self) -> bool:
+        return self._mk_visible
+
+    def markup_count(self) -> int:
+        return len(self._mk_items)
+
+    def can_undo_markup(self) -> bool:
+        return bool(self._mk_undo)
+
+    # -- editing ------------------------------------------------------ #
+
+    def _records(self) -> list:
+        if self._mk_store is None:
+            return []
+        return self._mk_store.sheet(self._mk_key)
+
+    def _add_markup(self, m) -> None:
+        if self._mk_store is None:
+            return
+        self._records().append(m)
+        self._mk_undo.append(('add', m, None))
+        self._rebuild_markup()
+        self.markupChanged.emit()
+
+    def delete_selected_markup(self) -> int:
+        if self._mk_store is None:
+            return 0
+        ids = {item.data(0) for item in self._mk_items.values()
+               if item.isSelected()}
+        if not ids:
+            return 0
+        records = self._records()
+        removed = [(i, m) for i, m in enumerate(records) if m.id in ids]
+        for _, m in reversed(removed):
+            records.remove(m)
+        self._mk_undo.append(('delete', [m for _, m in removed],
+                              [i for i, _ in removed]))
+        self._rebuild_markup()
+        self.markupChanged.emit()
+        return len(removed)
+
+    def clear_markup_on_sheet(self) -> int:
+        if self._mk_store is None:
+            return 0
+        records = self._records()
+        if not records:
+            return 0
+        gone = list(records)
+        self._mk_undo.append(('delete', gone, list(range(len(gone)))))
+        records.clear()
+        self._rebuild_markup()
+        self.markupChanged.emit()
+        return len(gone)
+
+    def undo_markup(self) -> bool:
+        if not self._mk_undo or self._mk_store is None:
+            return False
+        action, payload, extra = self._mk_undo.pop()
+        records = self._records()
+        if action == 'add':
+            if payload in records:
+                records.remove(payload)
+        elif action == 'delete':
+            for m, index in zip(payload, extra):
+                records.insert(min(index, len(records)), m)
+        elif action == 'move':
+            for m, pts in zip(payload, extra):
+                m.points = pts
+        self._rebuild_markup()
+        self.markupChanged.emit()
+        return True
+
+    def _sync_moved_markup(self) -> None:
+        """Write dragged items back into the store.
+
+        Items are built at absolute scene positions, so a drag shows up
+        as a non-zero item position; that offset is converted back to
+        sheet fractions and folded into the record.
+        """
+        if self._mk_store is None:
+            return
+        content = self._content_rect()
+        if content.isEmpty():
+            return
+        by_id = {m.id: m for m in self._records()}
+        moved, before = [], []
+        for mid, item in self._mk_items.items():
+            origin = self._mk_origin.get(mid, QPointF())
+            delta = item.pos() - origin
+            if abs(delta.x()) < 1e-9 and abs(delta.y()) < 1e-9:
+                continue
+            record = by_id.get(mid)
+            if record is None:
+                continue
+            dx = delta.x() / content.width()
+            dy = delta.y() / content.height()
+            moved.append(record)
+            before.append(list(record.points))
+            record.points = [(x + dx, y + dy) for x, y in record.points]
+        if not moved:
+            return
+        self._mk_undo.append(('move', moved, before))
+        self._rebuild_markup()
+        self.markupChanged.emit()
+
+    # -- drawing a new one -------------------------------------------- #
+
+    def _cancel_draft(self) -> None:
+        if self._draft_item is not None:
+            try:
+                if self._draft_item.scene() is self._scene:
+                    self._scene.removeItem(self._draft_item)
+            except RuntimeError:
+                pass
+        self._draft_item = None
+        self._draft_points = []
+
+    def _draft_markup(self):
+        pts = [mk.to_norm(p, self._content_rect()) for p in self._draft_points]
+        return mk.Markup(kind=self._mk_tool, points=pts, color=self._mk_color,
+                         author=mk.current_author())
+
+    def _show_draft(self) -> None:
+        content = self._content_rect()
+        if content.isEmpty() or len(self._draft_points) < 2:
+            return
+        item = mk.build_item(self._draft_markup(), content)
+        if item is None:
+            return
+        if self._draft_item is not None and self._draft_item.scene() is self._scene:
+            self._scene.removeItem(self._draft_item)
+        item.setZValue(21)
+        item.setOpacity(0.85)
+        self._scene.addItem(item)
+        self._draft_item = item
+
+    def _markup_press(self, event: QMouseEvent) -> None:
+        if self._mk_store is None or self._svg_item is None:
+            self.statusMessage.emit("Open a drawing before adding markup.")
+            return
+        pt = self.mapToScene(event.position().toPoint())
+
+        if self._mk_tool == mk.TEXT:
+            text, ok = QInputDialog.getText(self, "Markup text", "Note:")
+            if ok and text.strip():
+                content = self._content_rect()
+                self._add_markup(mk.Markup(
+                    kind=mk.TEXT, points=[mk.to_norm(pt, content)],
+                    color=self._mk_color, text=text.strip(),
+                    author=mk.current_author()))
+            self.markupToolFinished.emit()
+            return
+
+        self._draft_points = [pt, pt]
+        event.accept()
+
+    def _markup_move(self, event: QMouseEvent) -> None:
+        pt = self.mapToScene(event.position().toPoint())
+        if self._mk_tool == mk.PEN:
+            # Thin the trail: a point every few pixels is plenty, and
+            # keeps the sidecar from growing to megabytes.
+            last = self._draft_points[-1]
+            step = 3.0 / max(1e-6, self.transform().m11())
+            if (abs(pt.x() - last.x()) > step or abs(pt.y() - last.y()) > step):
+                self._draft_points.append(pt)
+        else:
+            self._draft_points[-1] = pt
+        self._show_draft()
+        event.accept()
+
+    def _markup_release(self, event: QMouseEvent) -> None:
+        pt = self.mapToScene(event.position().toPoint())
+        if self._mk_tool == mk.PEN:
+            self._draft_points.append(pt)
+        else:
+            self._draft_points[-1] = pt
+
+        points = list(self._draft_points)
+        tool = self._mk_tool
+        self._cancel_draft()
+
+        if len(points) >= 2:
+            span = (points[0] - points[-1])
+            scale = max(1e-9, self.transform().m11())
+            if tool == mk.PEN:
+                enough = len(points) > 2
+            else:
+                enough = (abs(span.x()) * scale > 4 or abs(span.y()) * scale > 4)
+            if enough:
+                content = self._content_rect()
+                self._add_markup(mk.Markup(
+                    kind=tool,
+                    points=[mk.to_norm(p, content) for p in points],
+                    color=self._mk_color, author=mk.current_author()))
+        self.markupToolFinished.emit()
+        event.accept()
+
+    # ------------------------------------------------------------------ #
+    #  Snapshot to clipboard
+    # ------------------------------------------------------------------ #
+
+    def set_snapshot_mode(self, enabled: bool) -> None:
+        self._snap_mode = bool(enabled)
+        if not enabled:
+            self._snap_origin = None
+            self._rubber.hide()
+            if self._pan_mode:
+                self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+
+    def snapshot_mode(self) -> bool:
+        return self._snap_mode
+
+    def _snap_press(self, event: QMouseEvent) -> None:
+        self._snap_origin = event.position()
+        self._rubber.setGeometry(QRect(self._snap_origin.toPoint(), QSize()))
+        self._rubber.show()
+        event.accept()
+
+    def _snap_move(self, event: QMouseEvent) -> None:
+        if self._snap_origin is None:
+            return
+        rect = QRect(self._snap_origin.toPoint(),
+                     event.position().toPoint()).normalized()
+        self._rubber.setGeometry(rect)
+        event.accept()
+
+    def _snap_release(self, event: QMouseEvent) -> None:
+        origin = self._snap_origin
+        self._snap_origin = None
+        self._rubber.hide()
+        self.set_snapshot_mode(False)
+        if origin is None:
+            return
+        rect = QRect(origin.toPoint(), event.position().toPoint()).normalized()
+        if rect.width() < 4 or rect.height() < 4:
+            self.statusMessage.emit("Snapshot cancelled — drag a region to copy.")
+            return
+        scene_rect = self.mapToScene(rect).boundingRect()
+        self.copy_region_to_clipboard(scene_rect)
+        event.accept()
+
+    def copy_view_to_clipboard(self) -> bool:
+        """Copy everything currently on screen."""
+        if self._svg_item is None:
+            return False
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        return self.copy_region_to_clipboard(
+            visible.intersected(self._content_rect()))
+
+    def copy_region_to_clipboard(self, scene_rect: QRectF) -> bool:
+        image = self.render_region(scene_rect)
+        if image is None:
+            return False
+        QGuiApplication.clipboard().setImage(image)
+        self.snapshotTaken.emit(image.width(), image.height())
+        return True
+
+    def render_region(self, scene_rect: QRectF, oversample: float = 2.0,
+                      max_px: int = 8000) -> QImage | None:
+        """Render part of the drawing to an image, redlines included.
+
+        Rendered from the scene rather than grabbed from the widget, so
+        the result is at print resolution instead of at whatever the
+        monitor happens to be — a snapshot pasted into a report should
+        not be a photograph of a screen.
+        """
+        if self._svg_item is None or scene_rect.width() <= 0 or scene_rect.height() <= 0:
+            return None
+        scale = max(1e-6, self.transform().m11()) * max(1.0, oversample)
+        w = int(round(scene_rect.width() * scale))
+        h = int(round(scene_rect.height() * scale))
+        if w < 2 or h < 2:
+            return None
+        if max(w, h) > max_px:
+            shrink = max_px / max(w, h)
+            w = max(2, int(w * shrink))
+            h = max(2, int(h * shrink))
+
+        image = QImage(w, h, QImage.Format.Format_ARGB32)
+        if image.isNull():
+            return None
+        # White, not the viewer's dark background: this is going into an
+        # email or a report, next to white paper.
+        image.fill(QColor("#ffffff"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        try:
+            self._scene.render(painter, QRectF(0, 0, w, h), scene_rect,
+                               Qt.AspectRatioMode.IgnoreAspectRatio)
+        finally:
+            painter.end()
+        return image
 
     # ------------------------------------------------------------------ #
     #  Measure tool helpers

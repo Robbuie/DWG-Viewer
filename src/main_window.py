@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QAction, QIcon, QKeySequence
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSize
+from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QColor, QActionGroup
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QLabel,
     QToolBar, QWidget, QProgressBar, QMessageBox,
@@ -19,6 +19,7 @@ from src.layer_panel import LayerPanel
 from src.converter import DWGConverter, DrawingError
 from src.version import __version__, APP_NAME
 from src.update_ui import UpdateChecker
+from src import markup as mk
 
 
 # ------------------------------------------------------------------ #
@@ -89,10 +90,21 @@ class MainWindow(QMainWindow):
         self._load_worker: _LoadWorker | None = None
         self._geometry_worker: _GeometryWorker | None = None
 
+        self._markup_store: mk.MarkupStore | None = None
+        self._markup_warned_fallback = False
+        # Redlines save themselves; a short delay coalesces a burst of
+        # edits into one write instead of hitting a network share on
+        # every stroke.
+        self._markup_save_timer = QTimer(self)
+        self._markup_save_timer.setSingleShot(True)
+        self._markup_save_timer.setInterval(400)
+        self._markup_save_timer.timeout.connect(self._save_markup)
+
         self._updater = UpdateChecker(self)
 
         self._build_ui()
         self._build_toolbar()
+        self._build_markup_toolbar()
         self._build_statusbar()
 
         # Quiet daily check: says nothing unless there is something to say.
@@ -125,6 +137,11 @@ class MainWindow(QMainWindow):
         self._canvas.coordChanged.connect(self._on_coord_changed)
         self._canvas.measurementDone.connect(self._on_measurement_done)
         self._canvas.pageNavigateRequested.connect(self._navigate_file)
+        self._canvas.markupChanged.connect(self._on_markup_changed)
+        self._canvas.markupToolFinished.connect(self._sync_markup_actions)
+        self._canvas.snapshotTaken.connect(self._on_snapshot_taken)
+        self._canvas.statusMessage.connect(
+            lambda msg: self.statusBar().showMessage(msg, 4000))
         splitter.addWidget(self._canvas)
 
         # Right: layer panel
@@ -198,6 +215,25 @@ class MainWindow(QMainWindow):
         self._act_measure.setCheckable(True)
         self._act_measure.triggered.connect(self._set_measure_mode)
         tb.addAction(self._act_measure)
+
+        self._act_snap = QAction("📷  Snapshot", self)
+        self._act_snap.setToolTip(
+            "Drag a region to copy it to the clipboard (S)")
+        self._act_snap.setShortcut(QKeySequence("S"))
+        self._act_snap.setCheckable(True)
+        self._act_snap.toggled.connect(self._set_snapshot_mode)
+        tb.addAction(self._act_snap)
+
+        act_copy_view = QAction("Copy view", self)
+        act_copy_view.setToolTip("Copy the whole visible drawing (Ctrl+Shift+C)")
+        act_copy_view.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        act_copy_view.triggered.connect(self._copy_view)
+        self.addAction(act_copy_view)
+
+        act_save_img = QAction("Save image…", self)
+        act_save_img.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        act_save_img.triggered.connect(self._save_view_image)
+        self.addAction(act_save_img)
 
         tb.addSeparator()
 
@@ -275,6 +311,247 @@ class MainWindow(QMainWindow):
         act_about = QAction("About", self)
         act_about.triggered.connect(self._about)
         tb.addAction(act_about)
+
+    # ------------------------------------------------------------------ #
+    #  Markup toolbar
+    # ------------------------------------------------------------------ #
+
+    _MARKUP_COLORS = [
+        ("Red", "#ff3b30"), ("Yellow", "#ffcc00"), ("Green", "#34c759"),
+        ("Blue", "#0a84ff"), ("Magenta", "#ff2d95"), ("Black", "#101010"),
+    ]
+
+    _MARKUP_TOOLS = [
+        ("select", "\u2196", "Select", "Select, move or delete markup (V)", "V"),
+        (mk.CLOUD, "\u2601", "Cloud", "Revision cloud — drag a region (C)", "C"),
+        (mk.BOX, "\u25ad", "Box", "Rectangle — drag a region (B)", "B"),
+        (mk.ELLIPSE, "\u2b2d", "Ellipse", "Ellipse — drag a region (E)", "E"),
+        (mk.ARROW, "\u2197", "Arrow", "Arrow — drag from tail to head (A)", "A"),
+        (mk.PEN, "\u270e", "Pen", "Freehand line (D)", "D"),
+        (mk.TEXT, "T", "Note", "Text note — click where it goes (T)", "T"),
+    ]
+
+    def _build_markup_toolbar(self):
+        self.addToolBarBreak()
+        tb = QToolBar("Markup")
+        tb.setMovable(False)
+        tb.setStyleSheet(
+            "QToolBar { background: #262626; border-bottom: 1px solid #444;"
+            " spacing: 4px; }"
+            "QToolButton { color: #ccc; padding: 3px 7px; border-radius: 3px; }"
+            "QToolButton:hover { background: #3a3a3a; }"
+            "QToolButton:checked { background: #a33; color: #fff; }")
+        self.addToolBar(tb)
+
+        label = QLabel("  Markup ")
+        label.setStyleSheet("color:#888; font-size:11px;")
+        tb.addWidget(label)
+
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._markup_actions = {}
+        for tool, glyph, name, tip, key in self._MARKUP_TOOLS:
+            act = QAction(f"{glyph}  {name}", self)
+            act.setToolTip(tip)
+            act.setShortcut(QKeySequence(key))
+            act.setCheckable(True)
+            act.triggered.connect(
+                lambda checked, t=tool: self._pick_markup_tool(t, checked))
+            group.addAction(act)
+            tb.addAction(act)
+            self._markup_actions[tool] = act
+
+        tb.addSeparator()
+
+        self._color_box = QComboBox()
+        self._color_box.setToolTip("Markup colour")
+        self._color_box.setIconSize(QSize(12, 12))
+        self._color_box.setStyleSheet(
+            "QComboBox { background: #3a3a3a; color: #ccc; border: 1px solid #555;"
+            " border-radius: 3px; padding: 2px 6px; }"
+            "QComboBox QAbstractItemView { background: #2d2d2d; color: #ccc;"
+            " selection-background-color: #3a6ea8; }")
+        self._markup_bar = tb
+        for name, hex_code in self._MARKUP_COLORS:
+            pix = QPixmap(12, 12)
+            pix.fill(QColor(hex_code))
+            self._color_box.addItem(QIcon(pix), name, hex_code)
+        self._color_box.currentIndexChanged.connect(
+            lambda i: self._canvas.set_markup_color(
+                self._color_box.itemData(i) or mk.DEFAULT_COLOR))
+        tb.addWidget(self._color_box)
+
+        tb.addSeparator()
+
+        self._act_mk_undo = QAction("\u21b6  Undo", self)
+        self._act_mk_undo.setToolTip("Undo the last markup change (Ctrl+Z)")
+        self._act_mk_undo.setShortcut(QKeySequence("Ctrl+Z"))
+        self._act_mk_undo.triggered.connect(self._undo_markup)
+        tb.addAction(self._act_mk_undo)
+
+        self._act_mk_delete = QAction("\u2715  Delete", self)
+        self._act_mk_delete.setToolTip("Delete the selected markup (Del)")
+        self._act_mk_delete.triggered.connect(self._delete_markup)
+        tb.addAction(self._act_mk_delete)
+
+        act_clear = QAction("Clear sheet", self)
+        act_clear.setToolTip("Remove every markup on this sheet")
+        act_clear.triggered.connect(self._clear_markup)
+        tb.addAction(act_clear)
+
+        tb.addSeparator()
+
+        self._act_mk_show = QAction("\U0001f441  Show markup", self)
+        self._act_mk_show.setToolTip("Show or hide all markup (H)")
+        self._act_mk_show.setShortcut(QKeySequence("H"))
+        self._act_mk_show.setCheckable(True)
+        self._act_mk_show.setChecked(True)
+        self._act_mk_show.toggled.connect(self._canvas.set_markup_visible)
+        tb.addAction(self._act_mk_show)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        self._markup_label = QLabel("No markup")
+        self._markup_label.setStyleSheet("color:#888; font-size:11px; padding-right:8px;")
+        tb.addWidget(self._markup_label)
+
+        act_bar = QAction("Show/hide the markup toolbar", self)
+        act_bar.setShortcut(QKeySequence("Ctrl+3"))
+        act_bar.triggered.connect(
+            lambda: self._markup_bar.setVisible(not self._markup_bar.isVisible()))
+        self.addAction(act_bar)
+
+        self._sync_markup_actions()
+
+    # -- markup slots -------------------------------------------------- #
+
+    def _pick_markup_tool(self, tool: str, checked: bool) -> None:
+        self._canvas.set_markup_tool(tool if checked else None)
+        if checked and self._act_snap.isChecked():
+            self._act_snap.setChecked(False)
+        self._sync_markup_actions()
+
+    def _sync_markup_actions(self) -> None:
+        active = self._canvas.markup_tool()
+        for tool, act in self._markup_actions.items():
+            act.blockSignals(True)
+            act.setChecked(tool == active)
+            act.blockSignals(False)
+        self._act_mk_undo.setEnabled(self._canvas.can_undo_markup())
+        self._act_mk_show.blockSignals(True)
+        self._act_mk_show.setChecked(self._canvas.markup_visible())
+        self._act_mk_show.blockSignals(False)
+        self._update_markup_label()
+
+    def _update_markup_label(self) -> None:
+        n = self._canvas.markup_count()
+        if not n:
+            self._markup_label.setText("No markup")
+            return
+        where = ""
+        if self._markup_store is not None and self._markup_store.is_fallback:
+            where = " · saved locally"
+        self._markup_label.setText(
+            f"{n} markup item{'s' if n != 1 else ''}{where}")
+
+    def _undo_markup(self) -> None:
+        if not self._canvas.undo_markup():
+            self.statusBar().showMessage("Nothing to undo.", 2500)
+        self._sync_markup_actions()
+
+    def _delete_markup(self) -> None:
+        n = self._canvas.delete_selected_markup()
+        if not n:
+            self.statusBar().showMessage(
+                "Select markup first — press V, then click it.", 3500)
+        self._sync_markup_actions()
+
+    def _clear_markup(self) -> None:
+        if self._canvas.markup_count() == 0:
+            return
+        if QMessageBox.question(
+                self, "Clear markup",
+                "Remove every markup item on this sheet?") != \
+                QMessageBox.StandardButton.Yes:
+            return
+        self._canvas.clear_markup_on_sheet()
+        self._sync_markup_actions()
+
+    def _on_markup_changed(self) -> None:
+        self._markup_save_timer.start()
+        self._sync_markup_actions()
+
+    def _save_markup(self) -> None:
+        store = self._markup_store
+        if store is None:
+            return
+        if not store.save():
+            self.statusBar().showMessage(
+                "Markup could not be saved — the folder is not writable.", 6000)
+            return
+        if store.is_fallback and not self._markup_warned_fallback:
+            self._markup_warned_fallback = True
+            self.statusBar().showMessage(
+                f"This folder is read-only, so markup is being kept on this "
+                f"PC instead ({store.path}).", 9000)
+        self._update_markup_label()
+
+    def _sheet_key(self) -> str:
+        conv = self._current_conv
+        if conv is None:
+            return "0"
+        names = conv.sheet_names()
+        index = self._sheet_box.currentIndex() if len(names) > 1 else 0
+        if 0 <= index < len(names):
+            return names[index]
+        return "0"
+
+    def _attach_markup(self) -> None:
+        self._canvas.set_markup_context(self._markup_store, self._sheet_key())
+        self._sync_markup_actions()
+
+    # ------------------------------------------------------------------ #
+    #  Snapshot
+    # ------------------------------------------------------------------ #
+
+    def _set_snapshot_mode(self, on: bool) -> None:
+        self._canvas.set_snapshot_mode(on)
+        if on:
+            for act in self._markup_actions.values():
+                act.setChecked(False)
+            self._canvas.set_markup_tool(None)
+            self.statusBar().showMessage(
+                "Drag a region to copy it to the clipboard — Esc cancels.", 5000)
+
+    def _copy_view(self) -> None:
+        if not self._canvas.copy_view_to_clipboard():
+            self.statusBar().showMessage("Nothing to copy — open a drawing first.",
+                                         3000)
+
+    def _on_snapshot_taken(self, w: int, h: int) -> None:
+        self._act_snap.setChecked(False)
+        self.statusBar().showMessage(
+            f"Copied to the clipboard at {w} \u00d7 {h} px — paste it anywhere.",
+            5000)
+
+    def _save_view_image(self) -> None:
+        if self._current_conv is None:
+            self.statusBar().showMessage("Open a drawing first.", 3000)
+            return
+        default = f"{self._current_conv.filepath.stem}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save image", default, "PNG image (*.png)")
+        if not path:
+            return
+        visible = self._canvas.mapToScene(
+            self._canvas.viewport().rect()).boundingRect()
+        image = self._canvas.render_region(visible)
+        if image is None or not image.save(path, "PNG"):
+            self.statusBar().showMessage("Could not write that image.", 4000)
+        else:
+            self.statusBar().showMessage(f"Saved {path}", 5000)
 
     # ------------------------------------------------------------------ #
     #  Updates
@@ -407,7 +684,14 @@ class MainWindow(QMainWindow):
         if self._load_worker and self._load_worker.isRunning():
             self._load_worker.terminate()
 
+        # Anything still pending for the previous drawing goes to disk
+        # before its store is replaced.
+        self._flush_markup()
+
         self._current_conv = None
+        self._canvas.set_markup_context(None, "0")
+        self._markup_store = mk.MarkupStore(filepath)
+        self._markup_warned_fallback = False
         self._canvas.clear()
         self._layers.clear()
         self._file_label.setText(self._loading_message(filepath))
@@ -454,6 +738,7 @@ class MainWindow(QMainWindow):
                 return
         else:
             self._canvas.load_svg(svg)
+        self._attach_markup()
         name = conv.filepath.name
         detail = "rasterised" if png else f"{len(layers)} layers"
         self._file_label.setText(f"{name}  ({detail})")
@@ -496,9 +781,11 @@ class MainWindow(QMainWindow):
         conv = self._current_conv
         if conv is None or index < 0:
             return
+        self._flush_markup()
         conv.set_sheet(index)
         self._layers.populate(conv.get_layers())
         self._start_render()
+        self._attach_markup()
 
     def _on_load_error(self, message: str):
         self._progress.setVisible(False)
@@ -533,12 +820,24 @@ class MainWindow(QMainWindow):
                     self.err.emit(str(exc))
 
         w = _RenderWorker(self._current_conv)
-        w.done.connect(lambda svg: (self._canvas.load_svg(svg), self._progress.setVisible(False)))
+        w.done.connect(lambda svg: (self._canvas.load_svg(svg),
+                                    self._attach_markup(),
+                                    self._progress.setVisible(False)))
         w.err.connect(lambda msg: (self._progress.setVisible(False),
                                    self.statusBar().showMessage(f"Render error: {msg}", 4000)))
         w.finished.connect(w.deleteLater)
         self._render_worker = w
         w.start()
+
+    def _flush_markup(self) -> None:
+        """Write pending redlines now rather than on the timer."""
+        if self._markup_save_timer.isActive():
+            self._markup_save_timer.stop()
+            self._save_markup()
+
+    def closeEvent(self, event):
+        self._flush_markup()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------ #
     #  Layer panel slots

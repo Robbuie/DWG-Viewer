@@ -1,7 +1,8 @@
 # DWG Viewer
 
 A fast drawing viewer for Windows: folder thumbnails, pan/zoom, layer
-toggles, and point-to-point measurement.
+toggles, point-to-point measurement, redline markup, and snapshots to
+the clipboard.
 
 ## Supported formats
 
@@ -56,13 +57,15 @@ DXF and DWFx work without it.
 python tests\test_dwfx.py
 python tests\test_converter_dwfx.py
 python tests\test_navigator.py
+python tests\test_markup.py
 ```
 
 The first two run on the standard library alone (they stub ezdxf if it is
 missing) and build their own synthetic DWFx packages, so no sample
-drawings are needed. `test_navigator.py` drives the navigator and the
-panel toggles through real Qt events on the offscreen platform, and
-skips itself if PyQt6 is not installed.
+drawings are needed. `test_navigator.py` and `test_markup.py`
+drive the navigator, the panel toggles, the redline tools and the
+snapshot capture through real Qt events on the offscreen platform, and
+skip themselves if PyQt6 is not installed.
 
 ## Diagnostics
 
@@ -82,9 +85,18 @@ arguments.
 | `P` | Pan mode |
 | `R` | Re-render after toggling layers |
 | `N` | Show / hide the navigator |
+| `S` | Snapshot — drag a region to the clipboard |
+| `Ctrl`+`Shift`+`C` | Copy the whole visible drawing |
+| `Ctrl`+`Shift`+`S` | Save the visible drawing as a PNG |
+| `V` | Select markup |
+| `C` `B` `E` `A` `D` `T` | Cloud, box, ellipse, arrow, pen, note |
+| `H` | Show / hide all markup |
+| `Ctrl`+`Z` | Undo the last markup change |
+| `Del` | Delete the selected markup |
 | `Ctrl`+`1` | Show / hide the file browser |
 | `Ctrl`+`2` | Show / hide the layer panel |
 | `Ctrl`+`\` | Show / hide both side panels |
+| `Ctrl`+`3` | Show / hide the markup toolbar |
 | `←` `→` | Previous / next file |
 
 Middle-drag (or Alt+left-drag) pans; the scroll wheel zooms.
@@ -101,6 +113,41 @@ entirely — the choice sticks for the next drawing.
 
 Because it floats over the canvas rather than living in a panel, it is
 still there with both side panels hidden.
+
+## Markup
+
+Redlines are the reason Design Review is still installed at places that
+stopped using everything else about it, so they work the same way here:
+pick a tool, draw on the sheet, and the next person to open the file
+sees it.
+
+* **Tools** — revision cloud, box, ellipse, arrow, freehand pen and text
+  note, in six colours. `V` selects, so markup can be dragged to a new
+  spot or deleted; `Ctrl`+`Z` undoes; `H` hides the lot when you want a
+  clean look at the drawing underneath.
+* **Where it is kept** — `<drawing>.markup.json` beside the drawing, so
+  redlines travel with the file on a shared engineering folder. Saving
+  is automatic and coalesced, so a burst of edits is one write.
+* **Read-only folders** — if the drawing's folder cannot be written to,
+  markup falls back to `%LOCALAPPDATA%\DWGViewer\cache\markup` and the
+  status bar says so. Work is never silently lost.
+* **Coordinates** — every markup is stored as a fraction of the sheet's
+  extents rather than in pixels, so it stays put when the drawing is
+  re-rendered at a different size, when a layer is toggled, or when the
+  same DWFx is opened on a different monitor.
+* **Sheets** — multi-sheet DWFx keeps markup per sheet, keyed by sheet
+  name, so republishing a set with a sheet inserted does not shuffle
+  redlines onto the wrong drawing.
+
+## Snapshots
+
+`S`, then drag a region: it lands on the clipboard ready to paste into
+an email or a report. `Ctrl`+`Shift`+`C` copies the whole visible
+drawing and `Ctrl`+`Shift`+`S` writes it to a PNG.
+
+Snapshots are re-rendered from the drawing at roughly twice screen
+resolution on a white background, with any markup included — a snapshot
+pasted into a report should not look like a photograph of a monitor.
 
 ## Thumbnails
 

@@ -18,32 +18,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPalette, QColor, QImageReader
+from PyQt6.QtGui import QImageReader
 
+from src import theme
 from src.main_window import MainWindow
-
-
-def _apply_dark_palette(app: QApplication) -> None:
-    app.setStyle("Fusion")
-    pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window,          QColor("#2d2d2d"))
-    pal.setColor(QPalette.ColorRole.WindowText,      QColor("#dcdcdc"))
-    pal.setColor(QPalette.ColorRole.Base,            QColor("#1e1e1e"))
-    pal.setColor(QPalette.ColorRole.AlternateBase,   QColor("#2a2a2a"))
-    pal.setColor(QPalette.ColorRole.ToolTipBase,     QColor("#3a3a3a"))
-    pal.setColor(QPalette.ColorRole.ToolTipText,     QColor("#dcdcdc"))
-    pal.setColor(QPalette.ColorRole.Text,            QColor("#dcdcdc"))
-    pal.setColor(QPalette.ColorRole.Button,          QColor("#3a3a3a"))
-    pal.setColor(QPalette.ColorRole.ButtonText,      QColor("#dcdcdc"))
-    pal.setColor(QPalette.ColorRole.BrightText,      Qt.GlobalColor.red)
-    pal.setColor(QPalette.ColorRole.Link,            QColor("#4a9ee8"))
-    pal.setColor(QPalette.ColorRole.Highlight,       QColor("#3a6ea8"))
-    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-    # Disabled state
-    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,       QColor("#666"))
-    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#666"))
-    app.setPalette(pal)
 
 
 def main() -> None:
@@ -56,7 +34,11 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("DWG Viewer")
     app.setOrganizationName("DWGViewer")
-    _apply_dark_palette(app)
+    # Themes, accent and chrome density live in src/theme.py, the appearance
+    # system shared with the Redline PDF app. The viewer defaults to Drafting
+    # blue rather than that app's Redline red: same system, one colour apart,
+    # so the two read as a pair without the viewer looking like a markup tool.
+    theme.apply_saved(app, defaults={"accent": "blue"})
 
     window = MainWindow()
     window.show()

@@ -28,15 +28,17 @@ class _LayerRow(QWidget):
         # Colour swatch
         swatch = QFrame()
         swatch.setFixedSize(12, 12)
+        # The one colour in the app that is not the theme's to choose: it is
+        # the layer's own colour out of the drawing. Only the frame is themed.
         swatch.setStyleSheet(
-            f"background-color: {color_hex}; border: 1px solid #555; border-radius: 2px;"
+            f"background-color: {color_hex};"
+            " border: 1px solid palette(mid); border-radius: 2px;"
         )
         layout.addWidget(swatch)
 
         # Checkbox
         self._cb = QCheckBox(name)
         self._cb.setChecked(visible)
-        self._cb.setStyleSheet("QCheckBox { color: #ccc; font-size: 12px; }")
         self._cb.toggled.connect(lambda checked: self.toggled.emit(self._name, checked))
         layout.addWidget(self._cb)
         layout.addStretch()
@@ -70,15 +72,14 @@ class LayerPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _build_ui(self):
+        self.setObjectName("sidePanel")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 6, 4, 4)
         outer.setSpacing(4)
 
         # Header
         header = QLabel("Layers")
-        header.setStyleSheet(
-            "color: #ddd; font-weight: bold; font-size: 13px; padding-bottom: 2px;"
-        )
+        header.setObjectName("panelTitle")
         outer.addWidget(header)
 
         # Show all / Hide all buttons
@@ -86,12 +87,10 @@ class LayerPanel(QWidget):
         btn_row.setSpacing(4)
 
         self._show_all = QPushButton("Show All")
-        self._show_all.setStyleSheet(self._btn_style())
         self._show_all.clicked.connect(lambda: self._toggle_all(True))
         btn_row.addWidget(self._show_all)
 
         self._hide_all = QPushButton("Hide All")
-        self._hide_all.setStyleSheet(self._btn_style())
         self._hide_all.clicked.connect(lambda: self._toggle_all(False))
         btn_row.addWidget(self._hide_all)
 
@@ -100,16 +99,13 @@ class LayerPanel(QWidget):
         # Divider
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color: #444;")
+        line.setObjectName("divider")
         outer.addWidget(line)
 
         # Scrollable layer list
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            "QScrollArea { border: none; background: transparent; }"
-        )
 
         self._container = QWidget()
         self._container_layout = QVBoxLayout(self._container)
@@ -120,9 +116,7 @@ class LayerPanel(QWidget):
         # simply has no layers in it, which is worth saying.
         self._note = QLabel()
         self._note.setWordWrap(True)
-        self._note.setStyleSheet(
-            "color: #999; font-size: 11px; padding: 6px 4px;"
-        )
+        self._note.setObjectName("hint")
         self._note.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._note.hide()
         self._container_layout.addWidget(self._note)
@@ -211,11 +205,3 @@ class LayerPanel(QWidget):
             row.set_checked(visible)
         self.allToggled.emit(visible)
 
-    @staticmethod
-    def _btn_style() -> str:
-        return (
-            "QPushButton { background: #3a3a3a; color: #ccc; border: 1px solid #555; "
-            "border-radius: 3px; padding: 3px 8px; font-size: 11px; }"
-            "QPushButton:hover { background: #4a4a4a; }"
-            "QPushButton:pressed { background: #555; }"
-        )

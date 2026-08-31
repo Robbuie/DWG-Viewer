@@ -21,6 +21,7 @@ from src.version import __version__, APP_NAME
 from src.update_ui import UpdateChecker
 from src import markup as mk
 from src import printing
+from src.appearance import AppearanceDialog
 
 
 # ------------------------------------------------------------------ #
@@ -162,10 +163,6 @@ class MainWindow(QMainWindow):
         # Outer splitter: file browser | canvas | layers
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(4)
-        splitter.setStyleSheet(
-            "QSplitter::handle { background: #3a3a3a; }"
-            "QSplitter::handle:hover { background: #555; }"
-        )
 
         # Left: file browser
         self._browser = FileBrowser()
@@ -201,12 +198,7 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = QToolBar("Main Toolbar")
         tb.setMovable(False)
-        tb.setStyleSheet(
-            "QToolBar { background: #2d2d2d; border-bottom: 1px solid #444; spacing: 4px; }"
-            "QToolButton { color: #ccc; padding: 4px 8px; border-radius: 3px; }"
-            "QToolButton:hover { background: #3a3a3a; }"
-            "QToolButton:checked { background: #3a6ea8; color: #fff; }"
-        )
+        tb.setObjectName("actionsBar")
         self.addToolBar(tb)
 
         # Open Folder
@@ -332,12 +324,6 @@ class MainWindow(QMainWindow):
         self._sheet_box = QComboBox()
         self._sheet_box.setToolTip("Sheet within this drawing set")
         self._sheet_box.setMinimumWidth(140)
-        self._sheet_box.setStyleSheet(
-            "QComboBox { background: #3a3a3a; color: #ccc; border: 1px solid #555;"
-            " border-radius: 3px; padding: 2px 6px; }"
-            "QComboBox QAbstractItemView { background: #2d2d2d; color: #ccc;"
-            " selection-background-color: #3a6ea8; }"
-        )
         self._sheet_box.currentIndexChanged.connect(self._on_sheet_changed)
         self._sheet_action = tb.addWidget(self._sheet_box)
         self._sheet_action.setVisible(False)
@@ -353,6 +339,7 @@ class MainWindow(QMainWindow):
 
         # Push the update controls to the right-hand end of the toolbar.
         spacer = QWidget()
+        spacer.setObjectName("tspacer")
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
@@ -360,6 +347,11 @@ class MainWindow(QMainWindow):
         act_update.setToolTip("Check GitHub for a newer version")
         act_update.triggered.connect(self._check_updates)
         tb.addAction(act_update)
+
+        act_theme = QAction("\u25d1  Appearance", self)
+        act_theme.setToolTip("Theme, accent colour and chrome density")
+        act_theme.triggered.connect(self._appearance)
+        tb.addAction(act_theme)
 
         act_about = QAction("About", self)
         act_about.triggered.connect(self._about)
@@ -378,23 +370,16 @@ class MainWindow(QMainWindow):
         """
         bar = QToolBar("Find")
         bar.setMovable(False)
-        bar.setStyleSheet(
-            "QToolBar { background: #262626; border-top: 1px solid #444;"
-            " spacing: 6px; padding: 2px 6px; }"
-            "QToolButton { color: #ccc; padding: 3px 7px; border-radius: 3px; }"
-            "QToolButton:hover { background: #3a3a3a; }")
+        bar.setObjectName("findBar")
         self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, bar)
 
         label = QLabel("Find on sheet:")
-        label.setStyleSheet("color:#888; font-size:11px;")
+        label.setObjectName("hint")
         bar.addWidget(label)
 
         self._find_edit = QLineEdit()
         self._find_edit.setPlaceholderText("Tag, label or note…")
         self._find_edit.setMaximumWidth(280)
-        self._find_edit.setStyleSheet(
-            "QLineEdit { background:#2a2a2a; border:1px solid #444;"
-            " border-radius:3px; padding:3px 6px; color:#ddd; }")
         self._find_edit.returnPressed.connect(lambda: self._find_step(True))
         self._find_edit.textChanged.connect(self._on_find_text_changed)
         bar.addWidget(self._find_edit)
@@ -408,10 +393,11 @@ class MainWindow(QMainWindow):
         bar.addAction(act_next)
 
         self._find_label = QLabel("")
-        self._find_label.setStyleSheet("color:#888; font-size:11px;")
+        self._find_label.setObjectName("hint")
         bar.addWidget(self._find_label)
 
         spacer = QWidget()
+        spacer.setObjectName("tspacer")
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.addWidget(spacer)
 
@@ -511,16 +497,11 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak()
         tb = QToolBar("Markup")
         tb.setMovable(False)
-        tb.setStyleSheet(
-            "QToolBar { background: #262626; border-bottom: 1px solid #444;"
-            " spacing: 4px; }"
-            "QToolButton { color: #ccc; padding: 3px 7px; border-radius: 3px; }"
-            "QToolButton:hover { background: #3a3a3a; }"
-            "QToolButton:checked { background: #a33; color: #fff; }")
+        tb.setObjectName("toolsBar")
         self.addToolBar(tb)
 
         label = QLabel("  Markup ")
-        label.setStyleSheet("color:#888; font-size:11px;")
+        label.setObjectName("hint")
         tb.addWidget(label)
 
         group = QActionGroup(self)
@@ -542,11 +523,6 @@ class MainWindow(QMainWindow):
         self._color_box = QComboBox()
         self._color_box.setToolTip("Markup colour")
         self._color_box.setIconSize(QSize(12, 12))
-        self._color_box.setStyleSheet(
-            "QComboBox { background: #3a3a3a; color: #ccc; border: 1px solid #555;"
-            " border-radius: 3px; padding: 2px 6px; }"
-            "QComboBox QAbstractItemView { background: #2d2d2d; color: #ccc;"
-            " selection-background-color: #3a6ea8; }")
         self._markup_bar = tb
         for name, hex_code in self._MARKUP_COLORS:
             pix = QPixmap(12, 12)
@@ -586,11 +562,12 @@ class MainWindow(QMainWindow):
         tb.addAction(self._act_mk_show)
 
         spacer = QWidget()
+        spacer.setObjectName("tspacer")
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
         self._markup_label = QLabel("No markup")
-        self._markup_label.setStyleSheet("color:#888; font-size:11px; padding-right:8px;")
+        self._markup_label.setObjectName("hint")
         tb.addWidget(self._markup_label)
 
         act_bar = QAction("Show/hide the markup toolbar", self)
@@ -741,6 +718,10 @@ class MainWindow(QMainWindow):
     def _check_updates(self):
         self._updater.check_interactively()
 
+    def _appearance(self):
+        """Theme, accent and density — the settings shared across the suite."""
+        AppearanceDialog(self).exec()
+
     def _about(self):
         QMessageBox.about(
             self, f"About {APP_NAME}",
@@ -752,10 +733,6 @@ class MainWindow(QMainWindow):
 
     def _build_statusbar(self):
         sb = QStatusBar()
-        sb.setStyleSheet(
-            "QStatusBar { background: #2d2d2d; color: #888; font-size: 11px; "
-            "border-top: 1px solid #444; }"
-        )
         self.setStatusBar(sb)
 
         self._coord_label = QLabel("X: —    Y: —")
@@ -776,11 +753,6 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 0)   # indeterminate
         self._progress.setFixedWidth(120)
         self._progress.setVisible(False)
-        self._progress.setStyleSheet(
-            "QProgressBar { background: #3a3a3a; border: 1px solid #555; "
-            "border-radius: 3px; height: 14px; }"
-            "QProgressBar::chunk { background: #3a6ea8; border-radius: 2px; }"
-        )
         sb.addPermanentWidget(self._progress)
 
     # ------------------------------------------------------------------ #
@@ -1183,7 +1155,7 @@ class MainWindow(QMainWindow):
 
 def _vline() -> QWidget:
     line = QWidget()
+    line.setObjectName("vsep")
     line.setFixedWidth(1)
     line.setFixedHeight(16)
-    line.setStyleSheet("background: #555;")
     return line

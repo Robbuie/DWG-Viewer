@@ -24,6 +24,7 @@ from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
 
 from src.navigator import NavigatorOverlay
 from src import markup as mk
+from src import theme
 
 
 class _DetailWorker(QThread):
@@ -92,7 +93,7 @@ class DrawingCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
-        self.setBackgroundBrush(QColor("#1e1e1e"))
+        self.setBackgroundBrush(QColor(theme.current()["drawing-bg"]))
         self.setFrameShape(self.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -386,6 +387,20 @@ class DrawingCanvas(QGraphicsView):
         self._update_sampling()
         self._schedule_detail()
         self._update_navigator_view()
+
+    def apply_theme(self, values: dict) -> None:
+        """Re-colour the chrome this widget paints itself.
+
+        A QGraphicsView draws its own backdrop, so the stylesheet never
+        reaches it — without this the canvas keeps the old theme's grey and
+        is the one panel that does not switch.
+
+        It uses `drawing-bg` rather than `canvas-bg`: see the note on that
+        token in theme.py for why this one surface stays dark in the light
+        themes.
+        """
+        self.setBackgroundBrush(QColor(values["drawing-bg"]))
+        self.viewport().update()
 
     def set_pan_mode(self, enabled: bool) -> None:
         """Called by the toolbar Pan button to enable/disable left-click panning."""

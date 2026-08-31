@@ -204,13 +204,13 @@ class PrintOptionsDialog(QDialog):
                           "available. DWF and DWFx sheets can be printed "
                           "to scale.")
             note.setWordWrap(True)
-            note.setStyleSheet("color:#999; font-size:11px;")
+            note.setObjectName("hint")
             sl.addWidget(note)
         else:
             w, h = paper_inches
             size = QLabel(f"Sheet is {w:.2f} × {h:.2f} in "
                           f"({w * 25.4:.0f} × {h * 25.4:.0f} mm).")
-            size.setStyleSheet("color:#999; font-size:11px;")
+            size.setObjectName("hint")
             sl.addWidget(size)
         lay.addWidget(scale_box)
 

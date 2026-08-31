@@ -46,6 +46,8 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
                              QListWidgetItem, QLabel, QPushButton,
                              QFileDialog, QSizePolicy, QLineEdit)
 
+from src import theme
+
 _THUMB_W, _THUMB_H = 160, 110
 _RENDER_SCALE      = 2               # cache at 2x for crisp hi-DPI display
 _SUPPORTED         = {".dwg", ".dxf", ".dwf", ".dwfx"}
@@ -108,16 +110,20 @@ _RANK_FINAL   = 2      # our own render, or the cached PNG of one
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _badge_image(filepath: str) -> QImage:
+    # Painted rather than styled, so it has to look its colours up: a tile
+    # hardcoded dark is a black square sitting in a white list on the light
+    # themes — the exact failure this refactor exists to prevent.
+    t = theme.current()
     img = QImage(_THUMB_W, _THUMB_H, QImage.Format.Format_ARGB32)
-    img.fill(QColor("#2a2a2a"))
+    img.fill(QColor(t["bg-3"]))
     p = QPainter(img)
-    p.setPen(QColor("#444"))
+    p.setPen(QColor(t["line"]))
     p.drawRect(0, 0, _THUMB_W - 1, _THUMB_H - 1)
     font = QFont()
     font.setPointSize(18)
     font.setBold(True)
     p.setFont(font)
-    p.setPen(QColor("#555"))
+    p.setPen(QColor(t["txt-2"]))
     p.drawText(img.rect(), Qt.AlignmentFlag.AlignCenter, Path(filepath).suffix.upper())
     p.end()
     return img
@@ -125,7 +131,7 @@ def _badge_image(filepath: str) -> QImage:
 
 def _plain_pixmap() -> QPixmap:
     img = QImage(_THUMB_W, _THUMB_H, QImage.Format.Format_ARGB32)
-    img.fill(QColor("#2a2a2a"))
+    img.fill(QColor(theme.current()["bg-3"]))
     return QPixmap.fromImage(img)
 
 
@@ -144,7 +150,7 @@ def _svg_to_image(svg_string: str, w: int, h: int) -> QImage | None:
         if not rnd.isValid():
             return None
         img = QImage(w, h, QImage.Format.Format_ARGB32)
-        img.fill(QColor("#1e1e1e"))
+        img.fill(QColor(theme.current()["drawing-bg"]))
         p = QPainter(img)
         # Fit rather than stretch: sheet drawings are rarely the same
         # aspect ratio as the thumbnail tile.
@@ -504,6 +510,7 @@ class FileBrowser(QWidget):
     # ── UI ───────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        self.setObjectName("sidePanel")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(4)
@@ -513,9 +520,6 @@ class FileBrowser(QWidget):
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText("Select a folder…")
         self._path_edit.setReadOnly(True)
-        self._path_edit.setStyleSheet(
-            "QLineEdit{background:#2a2a2a;border:1px solid #444;"
-            "border-radius:3px;padding:3px 6px;color:#ccc;}")
         row.addWidget(self._path_edit)
 
         btn = QPushButton("…")
@@ -526,7 +530,7 @@ class FileBrowser(QWidget):
         lay.addLayout(row)
 
         self._count = QLabel("No folder selected")
-        self._count.setStyleSheet("color:#888;font-size:11px;")
+        self._count.setObjectName("hint")
         lay.addWidget(self._count)
 
         self._list = QListWidget()
@@ -541,11 +545,6 @@ class FileBrowser(QWidget):
         # Batched mode off-screen items have no geometry yet.
         self._list.setLayoutMode(QListWidget.LayoutMode.SinglePass)
         self._list.setSpacing(6)
-        self._list.setStyleSheet(
-            "QListWidget{background:#252525;border:none;}"
-            "QListWidget::item{color:#ccc;border-radius:4px;padding:2px;}"
-            "QListWidget::item:selected{background:#3a5a8a;}"
-            "QListWidget::item:hover{background:#333;}")
         self._list.itemActivated.connect(self._on_activated)
         lay.addWidget(self._list)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)

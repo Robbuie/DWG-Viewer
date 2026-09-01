@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QLabel,
     QToolBar, QWidget, QProgressBar, QMessageBox,
     QFileDialog, QSizePolicy, QComboBox, QLineEdit,
+    QToolButton, QMenu,
 )
 
 from src.file_browser import FileBrowser
@@ -21,6 +22,7 @@ from src.version import __version__, APP_NAME
 from src.update_ui import UpdateChecker
 from src import markup as mk
 from src import printing
+from src import recent
 from src.appearance import AppearanceDialog
 
 
@@ -201,12 +203,31 @@ class MainWindow(QMainWindow):
         tb.setObjectName("actionsBar")
         self.addToolBar(tb)
 
-        # Open Folder
+        # Open Folder — a split button. Pressing it asks for a folder as
+        # it always has; the arrow beside it drops the drawings and
+        # folders opened before. Recent lives here because the window has
+        # no menu bar to hang an "Open Recent" submenu off.
         act_open = QAction("📂  Open Folder", self)
-        act_open.setToolTip("Open a folder of DWG files (Ctrl+O)")
+        act_open.setToolTip("Open a folder of DWG files (Ctrl+O) — "
+                            "the arrow lists recent files and folders")
         act_open.setShortcut(QKeySequence("Ctrl+O"))
         act_open.triggered.connect(self._browse_folder)
-        tb.addAction(act_open)
+        # Ctrl+O still reaches it: setDefaultAction puts the action on the
+        # button, which lives in the toolbar, which lives in the window.
+        self._act_open = act_open
+
+        self._recent_menu = QMenu(self)
+        # Built on the way open, never cached: entries reorder on every
+        # file the user opens, and a stale menu is worse than none.
+        self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+
+        open_btn = QToolButton(tb)
+        open_btn.setDefaultAction(act_open)
+        open_btn.setMenu(self._recent_menu)
+        open_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        open_btn.setToolButtonStyle(tb.toolButtonStyle())
+        self._open_btn = open_btn
+        tb.addWidget(open_btn)
 
         act_print = QAction("🖨  Print", self)
         act_print.setToolTip("Print the drawing, to scale or fitted (Ctrl+P)")
@@ -764,6 +785,88 @@ class MainWindow(QMainWindow):
         if folder:
             self._browser.open_folder(folder)
 
+    # ------------------------------------------------------------------ #
+    #  Recent files and folders
+    # ------------------------------------------------------------------ #
+
+    def _rebuild_recent_menu(self) -> None:
+        """Fill the Open button's drop-down with what was opened before."""
+        menu = self._recent_menu
+        menu.clear()
+
+        files = recent.files()
+        folders = recent.folders()
+
+        if not files and not folders:
+            empty = menu.addAction("Nothing opened yet")
+            empty.setEnabled(False)
+            return
+
+        if files:
+            header = menu.addAction("Recent Files")
+            header.setEnabled(False)
+            for i, path in enumerate(files, 1):
+                act = menu.addAction(recent.menu_label(path, i, is_file=True))
+                act.setToolTip(path)
+                act.triggered.connect(
+                    lambda _checked=False, fp=path: self._open_recent_file(fp))
+
+        if folders:
+            if files:
+                menu.addSeparator()
+            header = menu.addAction("Recent Folders")
+            header.setEnabled(False)
+            for path in folders:
+                act = menu.addAction(recent.menu_label(path, is_file=False))
+                act.setToolTip(path)
+                act.triggered.connect(
+                    lambda _checked=False, fp=path: self._open_recent_folder(fp))
+
+        menu.addSeparator()
+        clear = menu.addAction("Clear Recent")
+        clear.setToolTip("Forget both lists")
+        clear.triggered.connect(self._clear_recent)
+
+    def _open_recent_file(self, filepath: str) -> None:
+        path = Path(filepath)
+        # Existence is checked here and nowhere else: this is one path,
+        # picked deliberately, so a slow share costs a moment instead of
+        # stalling the menu every time it drops.
+        try:
+            missing = not path.is_file()
+        except OSError:
+            missing = True
+        if missing:
+            recent.remove_file(filepath)
+            QMessageBox.information(
+                self, "File not found",
+                f"{path.name} is no longer at\n\n{path.parent}\n\n"
+                "It has been removed from the recent list.")
+            return
+        if self._browser.folder != path.parent:
+            self._browser.open_folder(path.parent)
+        self._browser.select_file(str(path))
+        self._open_file(str(path))
+
+    def _open_recent_folder(self, folder: str) -> None:
+        path = Path(folder)
+        try:
+            missing = not path.is_dir()
+        except OSError:
+            missing = True
+        if missing:
+            recent.remove_folder(folder)
+            QMessageBox.information(
+                self, "Folder not found",
+                f"{path} is no longer available.\n\n"
+                "It has been removed from the recent list.")
+            return
+        self._browser.open_folder(path)
+
+    def _clear_recent(self) -> None:
+        recent.clear()
+        self.statusBar().showMessage("Recent files and folders cleared.", 3000)
+
     def _set_pan_mode(self):
         self._act_pan.setChecked(True)
         self._act_measure.setChecked(False)
@@ -834,6 +937,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _open_file(self, filepath: str):
+        recent.add_file(filepath)
         if self._load_worker and self._load_worker.isRunning():
             self._load_worker.terminate()
         if self._raster_worker and self._raster_worker.isRunning():

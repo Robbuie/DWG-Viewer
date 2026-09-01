@@ -416,6 +416,20 @@ QToolButton:focus:!checked {
 QToolButton:focus:!checked:hover { background: var(--bg-3); }
 QToolButton:checked:hover { background: var(--accent-wash); }
 QToolButton::menu-indicator { image: none; width: 0px; }
+/* Split buttons (Open ▾). The rule above hides the arrow, which is right
+   for a plain tool but would leave a split button with no sign that half
+   of it opens a menu; the hairline divider is what makes the two halves
+   legible, arrow or no arrow. */
+/* The arrow half is drawn inside the button's own rect, so without
+   this the label loses its last few characters. */
+QToolButton[popupMode="1"] { padding-right: 26px; }
+QToolButton::menu-button {
+    width: 18px;
+    border-left: 1px solid var(--line);
+    border-top-right-radius: var(--radius-sm);
+    border-bottom-right-radius: var(--radius-sm);
+}
+QToolButton::menu-button:hover { background: var(--bg-4); }
 
 /* --- menus ------------------------------------------------------------- */
 QMenuBar { background: var(--bg-1); color: var(--txt-1); border-bottom: 1px solid var(--line); }

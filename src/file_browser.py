@@ -47,6 +47,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
                              QFileDialog, QSizePolicy, QLineEdit)
 
 from src import theme
+from src import recent
 
 _THUMB_W, _THUMB_H = 160, 110
 _RENDER_SCALE      = 2               # cache at 2x for crisp hi-DPI display
@@ -555,10 +556,30 @@ class FileBrowser(QWidget):
 
     # ── Public API ───────────────────────────────────────────────────
 
+    @property
+    def folder(self) -> Path | None:
+        """The folder currently shown, or None before one is chosen."""
+        return self._folder
+
     def open_folder(self, folder) -> None:
         self._folder = Path(folder)
         self._path_edit.setText(str(self._folder))
+        recent.add_folder(self._folder)
         self._refresh()
+
+    def select_file(self, filepath: str) -> bool:
+        """Highlight a drawing in the grid without opening it.
+
+        Used when a file is opened from somewhere other than a click in
+        this panel — the recent list, say — so the grid agrees with what
+        is on the canvas and next/previous carries on from the right place.
+        """
+        item = self._items.get(str(Path(filepath)))
+        if item is None:
+            return False
+        self._list.setCurrentItem(item)
+        self._list.scrollToItem(item)
+        return True
 
     def _browse(self):
         start = str(self._folder) if self._folder else ""

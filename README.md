@@ -145,6 +145,7 @@ arguments.
 | `P` | Pan mode |
 | `R` | Re-render after toggling layers |
 | `N` | Show / hide the navigator |
+| `Ctrl`+`O` | Open a folder of drawings |
 | `Ctrl`+`P` | Print — to scale or fitted |
 | `Ctrl`+`F` | Find text on the sheet |
 | `F3` | Find the next match |
@@ -251,6 +252,21 @@ drawing and `Ctrl`+`Shift`+`S` writes it to a PNG.
 Snapshots are re-rendered from the drawing at roughly twice screen
 resolution on a white background, with any markup included — a snapshot
 pasted into a report should not look like a photograph of a monitor.
+
+## Recent files
+
+The arrow beside **Open Folder** drops a list of the drawings and folders
+opened before, newest first — up to twelve files and ten folders. Picking
+a drawing opens its folder in the browser and loads the sheet; the first
+nine are numbered, so `Alt`-releasing the menu and pressing `1` reopens the
+last drawing.
+
+The list is stored per user alongside the theme settings, and nothing is
+checked against disk until you pick it. That is deliberate: probing a dozen
+paths every time the menu opens would stall on any share that happens to be
+asleep, and would empty the list whenever the VPN was down. An entry that
+really has gone says so once and removes itself. **Clear Recent** forgets
+both lists.
 
 ## Thumbnails
 

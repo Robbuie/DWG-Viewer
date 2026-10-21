@@ -16,6 +16,7 @@ speed.
 from __future__ import annotations
 
 import io
+import math
 import re
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from PIL import Image, ImageDraw
 Image.MAX_IMAGE_PIXELS = None
 
 from src import dwf as classic
-from src.w2d import W2dDecoder, layer_label
+from src.w2d import W2dDecoder, layer_label, check_cancel
 
 # Resolution of the cached raster. On a 36x24 sheet this is ~460 dpi,
 # which puts 0.1-inch drawing text at 46 pixels tall — comfortably
@@ -109,6 +110,70 @@ _ACI_PACKED = (
 ACI = [((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF) for v in _ACI_PACKED]
 
 
+# ── Arcs Pillow cannot be trusted with ───────────────────────────────
+#
+# Pillow's arc/ellipse rasteriser stalls once the bounding box gets large:
+# a radius of ~50,000 px — a gentle curve on a 16000 px sheet, or any arc
+# at deep zoom — sits inside C for minutes while holding the GIL. The
+# whole app, UI thread included, freezes mid-decode until Windows reports
+# it Not Responding and it is killed, and since the raster never reaches
+# the cache the next open does exactly the same thing. Above this radius
+# the arc is flattened into a polyline here instead, which Pillow draws
+# (and clips) in no time at any coordinate size.
+_PIL_ARC_MAX_RADIUS = 16000
+_ARC_MAX_POINTS = 4096
+
+
+def _arc_points(px, py, a, b, start, end):
+    """Points along an elliptical arc in image space.
+
+    Same convention as the ``draw.arc(box, -end, -start)`` calls it
+    replaces: angles in degrees, counter-clockwise in drawing
+    coordinates, which is clockwise on screen once rows run downward.
+    """
+    span = (end - start) % 360.0
+    if span == 0.0:
+        span = 360.0
+    r = max(a, b)
+    # Chord error r*d^2/8 held to about a quarter pixel.
+    rad = math.radians(span)
+    n = int(rad * math.sqrt(r * 2.0)) + 2
+    n = max(8, min(_ARC_MAX_POINTS, n))
+    t0 = math.radians(start)
+    step = rad / (n - 1)
+    return [(px + a * math.cos(t0 + k * step),
+             py - b * math.sin(t0 + k * step)) for k in range(n)]
+
+
+def draw_arc(draw, px, py, a, b, start, end, fill):
+    """Draw an arc, routing oversized ones around Pillow's slow path."""
+    if max(a, b) <= _PIL_ARC_MAX_RADIUS:
+        try:
+            draw.arc([px - a, py - b, px + a, py + b], -end, -start, fill=fill)
+        except ValueError:
+            pass          # degenerate box — nothing to draw
+        return
+    # Pillow also walks a line pixel by pixel whether or not it is on the
+    # image, so only the runs of the arc that touch the image are drawn.
+    w, h = draw.im.size
+    if px + a < 0 or px - a > w or py + b < 0 or py - b > h:
+        return
+    pts = _arc_points(px, py, a, b, start, end)
+    run = []
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if (max(x0, x1) < -1 or min(x0, x1) > w + 1
+                or max(y0, y1) < -1 or min(y0, y1) > h + 1):
+            if len(run) > 1:
+                draw.line(run, fill=fill, width=1)
+            run = []
+            continue
+        if not run:
+            run.append((x0, y0))
+        run.append((x1, y1))
+    if len(run) > 1:
+        draw.line(run, fill=fill, width=1)
+
+
 class RasterSink:
     """Draws decoded primitives into a Pillow image."""
 
@@ -168,13 +233,9 @@ class RasterSink:
         if self.skip:
             return
         (px, py), = self._map([(cx, cy)])
-        rp = max(1, int(r * self.s))
-        try:
-            self.d.arc([px - rp, py - rp, px + rp, py + rp], -end, -start,
-                       fill=self.colour)
-            self.drawn += 1
-        except ValueError:
-            pass          # degenerate box — nothing to draw
+        rp = max(1, int(abs(r) * self.s))
+        draw_arc(self.d, px, py, rp, rp, start, end, self.colour)
+        self.drawn += 1
 
     def ellipse(self, cx, cy, major, minor, start, end, tilt):
         if self.skip:
@@ -182,12 +243,8 @@ class RasterSink:
         (px, py), = self._map([(cx, cy)])
         a = max(1, int(abs(major) * self.s))
         b = max(1, int(abs(minor) * self.s))
-        try:
-            self.d.arc([px - a, py - b, px + a, py + b], -end, -start,
-                       fill=self.colour)
-            self.drawn += 1
-        except ValueError:
-            pass
+        draw_arc(self.d, px, py, a, b, start, end, self.colour)
+        self.drawn += 1
 
     def text(self, x, y, s):
         # Sheet text is also present as stroked geometry, so it already
@@ -209,7 +266,7 @@ class RasterSink:
 
 
 def render_sheet(path, index: int = 0, width_px: int = DEFAULT_WIDTH,
-                 hidden: frozenset[str] = frozenset()):
+                 hidden: frozenset[str] = frozenset(), cancel=None):
     """Decode one sheet of a classic DWF and return
     (image, inches_box, layers).
 
@@ -225,6 +282,7 @@ def render_sheet(path, index: int = 0, width_px: int = DEFAULT_WIDTH,
         stream = doc.graphics_stream(index)
     if not stream:
         raise classic.ClassicDwfError("This DWF sheet has no graphics stream.")
+    check_cancel(cancel)
 
     view = read_view(stream)
     if view is None:
@@ -240,7 +298,7 @@ def render_sheet(path, index: int = 0, width_px: int = DEFAULT_WIDTH,
     img = Image.new("RGB", (width_px, height_px), (255, 255, 255))
     sink = RasterSink(ImageDraw.Draw(img), x0, y0, scale, height_px, hidden)
     decoder = W2dDecoder(stream)
-    decoder.run(sink)
+    decoder.run(sink, cancel)
     layers = [layer_label(i, n) for i, n in decoder.layer_names.items()]
 
     per_unit = read_inches_per_unit(stream)
@@ -377,13 +435,9 @@ class SheetGeometry:
                 start, end = self.arc_ang[k]
                 cpx = (cx - rx0) * sx
                 cpy = height_px - (cy - ry0) * sy
-                rpx = max(1.0, r * sx)
-                try:
-                    draw.arc([cpx - rpx, cpy - rpx, cpx + rpx, cpy + rpx],
-                             -float(end), -float(start),
-                             fill=palette[self.arc_col[k]])
-                except ValueError:
-                    pass
+                rpx = max(1.0, abs(float(r)) * sx)
+                draw_arc(draw, float(cpx), float(cpy), rpx, rpx,
+                         float(start), float(end), palette[self.arc_col[k]])
 
         for pts, colour, layer in self.tri:
             if drop is not None and layer in drop:
@@ -396,7 +450,7 @@ class SheetGeometry:
         return img
 
 
-def decode_geometry(path, index: int = 0) -> SheetGeometry:
+def decode_geometry(path, index: int = 0, cancel=None) -> SheetGeometry:
     """Decode a sheet into retained geometry. Costs one full pass over
     the opcode stream — tens of seconds — so callers keep the result."""
     from src.w2d import GeometryCollector
@@ -409,15 +463,21 @@ def decode_geometry(path, index: int = 0) -> SheetGeometry:
     if view is None:
         raise classic.ClassicDwfError("This DWF sheet declares no view extents.")
 
+    check_cancel(cancel)
     collector = GeometryCollector()
-    W2dDecoder(stream).run(collector)
+    W2dDecoder(stream).run(collector, cancel)
+    check_cancel(cancel)
     return SheetGeometry(collector, view, read_inches_per_unit(stream))
 
 
 def render_sheet_png(path, index: int = 0, width_px: int = DEFAULT_WIDTH,
-                     hidden: frozenset[str] = frozenset()
+                     hidden: frozenset[str] = frozenset(), cancel=None
                      ) -> tuple[bytes, tuple, list[str]]:
-    img, inches_box, layers = render_sheet(path, index, width_px, hidden)
+    img, inches_box, layers = render_sheet(path, index, width_px, hidden,
+                                           cancel)
+    # Encoding a sheet this size takes seconds and cannot be interrupted,
+    # so a decode cancelled at the last moment skips it.
+    check_cancel(cancel)
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=False)
     return buf.getvalue(), inches_box, layers

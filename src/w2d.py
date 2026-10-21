@@ -75,6 +75,26 @@ def layer_label(index: int, name: str) -> str:
     return name or f"Layer {index}"
 
 
+class Cancelled(Exception):
+    """A decode was abandoned because nobody wants its result any more.
+
+    Deliberately not a W2dError: callers that report a damaged file must
+    not report this as one.
+    """
+
+
+# How much of the stream is decoded between checks for cancellation. A
+# megabyte is a few milliseconds of work, so a cancelled decode stops
+# almost at once, and one comparison per opcode costs nothing measurable.
+_CANCEL_STRIDE = 1 << 20
+
+
+def check_cancel(cancel) -> None:
+    """Raise Cancelled if `cancel` (anything with is_set()) has been set."""
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+
 class UnsupportedOpcode(W2dError):
     def __init__(self, pos: int, byte: int):
         super().__init__(f"unsupported W2D opcode 0x{byte:02x} at offset {pos}")
@@ -516,14 +536,25 @@ class W2dDecoder:
 
     # -- main loop -----------------------------------------------------
 
-    def run(self, sink) -> None:
+    def run(self, sink, cancel=None) -> None:
+        """Decode the whole stream into `sink`.
+
+        `cancel` is an optional threading.Event. The decode runs on a
+        worker thread for up to a minute, and the only safe way to stop
+        a thread is to ask it: this checks the event every megabyte and
+        raises Cancelled when it is set.
+        """
         data, n = self.data, self.n
         unpack = struct.unpack_from
 
         # skip the "(W2D V06.00)" header
         i = data.find(b")") + 1 if data[:1] == b"(" else 0
+        next_check = i + _CANCEL_STRIDE if cancel is not None else n + 1
 
         while i < n:
+            if i >= next_check:
+                check_cancel(cancel)
+                next_check = i + _CANCEL_STRIDE
             b = data[i]
 
             if b in WS:

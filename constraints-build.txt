@@ -1,0 +1,19 @@
+# Exact versions for release builds (CI and build.bat).
+#
+# Why this exists: 1.9.0 was built by CI with Python 3.12, Qt 6.11.2 and
+# numpy 2.5.2, and that build hangs forever inside window.show() on at
+# least one machine. The stack shows Qt's RegisterDragDrop call waiting
+# on the RpcSs service and never returning. The same code built locally
+# with the versions below opens normally. Change these only after testing
+# the installed build on a real desktop, not just checking that CI passes.
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.0
+PyQt6-sip==13.11.1
+ezdxf==1.4.3
+numpy==2.4.3
+Pillow==12.2.0
+fonttools==4.62.1
+pyparsing==3.3.2
+typing_extensions==4.15.0
+pyinstaller==6.19.0
+pyinstaller-hooks-contrib==2026.3

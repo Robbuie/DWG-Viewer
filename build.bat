@@ -11,11 +11,11 @@ if "%APPVER%"=="" (
 )
 echo Building DWG Viewer %APPVER%
 
-pip install -r requirements.txt || exit /b 1
-pip install pyinstaller || exit /b 1
+python -m pip install -r requirements.txt -c constraints-build.txt || exit /b 1
+python -m pip install pyinstaller -c constraints-build.txt || exit /b 1
 
 rmdir /s /q build dist 2>nul
-pyinstaller --noconfirm --clean DWGViewer.spec || exit /b 1
+python -m PyInstaller --noconfirm --clean DWGViewer.spec || exit /b 1
 
 set ISCC="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not exist %ISCC% (

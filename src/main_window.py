@@ -3,6 +3,7 @@ main_window.py — application shell: toolbar, split layout, wiring.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSize
@@ -18,6 +19,7 @@ from src.file_browser import FileBrowser
 from src.canvas import DrawingCanvas
 from src.layer_panel import LayerPanel
 from src.converter import DWGConverter, DrawingError
+from src.w2d import Cancelled
 from src.version import __version__, APP_NAME
 from src.update_ui import UpdateChecker
 from src import markup as mk
@@ -29,6 +31,49 @@ from src.appearance import AppearanceDialog
 # ------------------------------------------------------------------ #
 #  Background loader thread
 # ------------------------------------------------------------------ #
+#
+# Stopping a worker. QThread.terminate() is never used: it kills the
+# thread wherever it happens to be — usually inside Pillow or zlib, often
+# holding the GIL or a heap lock — which leaves the process deadlocked or
+# corrupt. Workers are asked to stop instead (retire()), and the decoder
+# notices within a few milliseconds.
+#
+# Staying alive. A running QThread whose Python wrapper is garbage
+# collected makes Qt abort the whole process ("QThread: Destroyed while
+# thread is still running"). Replacing `self._load_worker` with a new
+# worker used to drop the last reference to the old one, so every started
+# worker is held here until its thread has actually finished.
+
+_LIVE_WORKERS: set = set()
+
+
+def _keep_alive(worker: QThread) -> None:
+    _LIVE_WORKERS.add(worker)
+    worker.finished.connect(lambda w=worker: _LIVE_WORKERS.discard(w))
+
+
+def _retire(worker) -> None:
+    """Ask a worker to stop and make sure its result is ignored. Returns
+    at once; the thread winds down on its own."""
+    if worker is None:
+        return
+    cancel = getattr(worker, "cancel", None)
+    if cancel is not None:
+        cancel.set()
+
+
+def _stop_all_workers(timeout_ms: int = 15000) -> None:
+    """At exit: cancel everything and give it a moment to unwind, so no
+    thread is still running when Qt tears the objects down."""
+    for worker in list(_LIVE_WORKERS):
+        _retire(worker)
+    for worker in list(_LIVE_WORKERS):
+        try:
+            if worker.isRunning():
+                worker.wait(timeout_ms)
+        except RuntimeError:
+            pass            # C++ side already gone
+
 
 class _GeometryWorker(QThread):
     """Decodes a classic DWF sheet into retained geometry in the
@@ -41,13 +86,17 @@ class _GeometryWorker(QThread):
         super().__init__()
         self._conv = conv
         self._sheet = conv.current_sheet
+        self.cancel = threading.Event()
 
     def run(self):
         try:
-            self._conv.ensure_geometry()
-        except Exception:
+            self._conv.ensure_geometry(cancel=self.cancel)
+        except BaseException:
+            # Cancelled, out of memory, a damaged stream: sharp zoom is
+            # an extra, and the raster already on screen stays usable.
             return
-        self.ready.emit(self._conv, self._sheet)
+        if not self.cancel.is_set():
+            self.ready.emit(self._conv, self._sheet)
 
 
 class _RasterWorker(QThread):
@@ -58,20 +107,26 @@ class _RasterWorker(QThread):
     are, and only the picture is replaced.
     """
 
-    done = pyqtSignal(object, object, object)
+    done = pyqtSignal(object, object, object, int)
     err = pyqtSignal(str)
 
     def __init__(self, conv):
         super().__init__()
         self._conv = conv
+        self._sheet = conv.current_sheet
+        self.cancel = threading.Event()
 
     def run(self):
         try:
-            png, extents = self._conv.render_raster()
-        except Exception as exc:
-            self.err.emit(str(exc))
+            png, extents = self._conv.render_raster(cancel=self.cancel)
+        except Cancelled:
             return
-        self.done.emit(self._conv, png, extents)
+        except Exception as exc:
+            if not self.cancel.is_set():
+                self.err.emit(str(exc) or type(exc).__name__)
+            return
+        if not self.cancel.is_set():
+            self.done.emit(self._conv, png, extents, self._sheet)
 
 
 class _LoadSignals(QObject):
@@ -88,17 +143,31 @@ class _LoadWorker(QThread):
         self.filepath = filepath
         self.signals = _LoadSignals()
         self._conv: DWGConverter | None = None
+        self.cancel = threading.Event()
 
     def run(self):
         try:
+            self._run()
+        except Cancelled:
+            pass
+        except BaseException as exc:          # never let a thread die loud
+            if not self.cancel.is_set():
+                self.signals.error.emit(f"Unexpected error: {exc!r}")
+
+    def _run(self):
+        try:
             conv = DWGConverter(self.filepath)
             conv.load()
+            if self.cancel.is_set():
+                return
             if conv.is_raster:
                 # Rendered before the layers are asked for: classic DWF
                 # names its layers inside the opcode stream, so they are
                 # a by-product of the decode rather than something that
                 # can be read up front.
-                png, extents = conv.render_raster()
+                png, extents = conv.render_raster(cancel=self.cancel)
+                if self.cancel.is_set():
+                    return
                 # Classic DWF has no text until the geometry pass runs,
                 # which happens after the drawing is already on screen.
                 self.signals.finished.emit(conv, conv.get_layers(), "", png,
@@ -110,10 +179,19 @@ class _LoadWorker(QThread):
                 index = conv.build_text_index(svg)
                 self.signals.finished.emit(conv, layers, svg, None, None,
                                            index, conv.layer_note() or "")
+        except Cancelled:
+            raise
         except DrawingError as exc:
-            self.signals.error.emit(str(exc))
+            if not self.cancel.is_set():
+                self.signals.error.emit(str(exc))
+        except MemoryError:
+            if not self.cancel.is_set():
+                self.signals.error.emit(
+                    "Not enough memory to open this drawing. Close other "
+                    "drawings or programs and try again.")
         except Exception as exc:
-            self.signals.error.emit(f"Unexpected error: {exc}")
+            if not self.cancel.is_set():
+                self.signals.error.emit(f"Unexpected error: {exc}")
 
 
 # ------------------------------------------------------------------ #
@@ -938,10 +1016,13 @@ class MainWindow(QMainWindow):
 
     def _open_file(self, filepath: str):
         recent.add_file(filepath)
-        if self._load_worker and self._load_worker.isRunning():
-            self._load_worker.terminate()
-        if self._raster_worker and self._raster_worker.isRunning():
-            self._raster_worker.terminate()
+        # Whatever the previous drawing still had running is asked to
+        # stop; its results are ignored if they arrive anyway.
+        for worker in (self._load_worker, self._raster_worker,
+                       self._geometry_worker):
+            _retire(worker)
+        self._raster_worker = None
+        self._geometry_worker = None
 
         # Anything still pending for the previous drawing goes to disk
         # before its store is replaced.
@@ -957,10 +1038,20 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(True)
 
         worker = _LoadWorker(filepath)
-        worker.signals.finished.connect(self._on_load_finished)
-        worker.signals.error.connect(self._on_load_error)
-        worker.finished.connect(lambda: self._progress.setVisible(False))
+        # Only the newest load may touch the window: an older one that
+        # was cancelled but had already queued its result is dropped.
+        worker.signals.finished.connect(
+            lambda *args, w=worker: self._on_load_finished(*args)
+            if w is self._load_worker and not w.cancel.is_set() else None)
+        worker.signals.error.connect(
+            lambda msg, w=worker: self._on_load_error(msg)
+            if w is self._load_worker and not w.cancel.is_set() else None)
+        worker.finished.connect(
+            lambda w=worker: self._progress.setVisible(False)
+            if w is self._load_worker else None)
+        worker.finished.connect(worker.deleteLater)
         self._load_worker = worker
+        _keep_alive(worker)
         worker.start()
 
     @staticmethod
@@ -1015,12 +1106,14 @@ class MainWindow(QMainWindow):
     def _start_geometry(self, conv: DWGConverter) -> None:
         """Decode geometry behind the drawing so deep zoom can be redrawn
         sharply instead of magnifying the raster."""
-        if self._geometry_worker is not None and self._geometry_worker.isRunning():
-            self._geometry_worker.terminate()
+        _retire(self._geometry_worker)
         worker = _GeometryWorker(conv)
-        worker.ready.connect(self._on_geometry_ready)
+        worker.ready.connect(
+            lambda c, sheet, w=worker: self._on_geometry_ready(c, sheet)
+            if w is self._geometry_worker else None)
         worker.finished.connect(worker.deleteLater)
         self._geometry_worker = worker
+        _keep_alive(worker)
         worker.start()
 
     def _on_geometry_ready(self, conv: DWGConverter, sheet: int) -> None:
@@ -1074,9 +1167,9 @@ class MainWindow(QMainWindow):
         for the new one once it has been decoded.
         """
         for worker in (self._geometry_worker, self._raster_worker):
-            if worker is not None and worker.isRunning():
-                worker.terminate()
-                worker.wait(2000)
+            _retire(worker)
+        self._geometry_worker = None
+        self._raster_worker = None
         self._canvas.set_detail_provider(None)
         self._canvas.set_text_index(None)
         self._update_find_status()
@@ -1091,18 +1184,25 @@ class MainWindow(QMainWindow):
             4000 if cached else 0)
 
         worker = _RasterWorker(conv)
-        worker.done.connect(self._on_sheet_rendered)
-        worker.err.connect(lambda msg: (
+        worker.done.connect(
+            lambda c, png, ext, sheet, w=worker:
+            self._on_sheet_rendered(c, png, ext, sheet)
+            if w is self._raster_worker else None)
+        worker.err.connect(lambda msg, w=worker: (
             self._progress.setVisible(False),
-            self.statusBar().showMessage(f"Render error: {msg}", 4000)))
+            self.statusBar().showMessage(f"Render error: {msg}", 4000))
+            if w is self._raster_worker else None)
         worker.finished.connect(worker.deleteLater)
         self._raster_worker = worker
+        _keep_alive(worker)
         worker.start()
 
-    def _on_sheet_rendered(self, conv, png, extents):
+    def _on_sheet_rendered(self, conv, png, extents, sheet=None):
         self._progress.setVisible(False)
         if conv is not self._current_conv:
             return          # a different drawing was opened meanwhile
+        if sheet is not None and sheet != conv.current_sheet:
+            return          # the user has moved to yet another sheet
         if not self._canvas.load_image(png, extents):
             self.statusBar().showMessage(
                 "That sheet could not be displayed.", 5000)
@@ -1158,6 +1258,7 @@ class MainWindow(QMainWindow):
                                    self.statusBar().showMessage(f"Render error: {msg}", 4000)))
         w.finished.connect(w.deleteLater)
         self._render_worker = w
+        _keep_alive(w)
         w.start()
 
     def _start_raster_render(self):
@@ -1177,6 +1278,9 @@ class MainWindow(QMainWindow):
                 "This DWF has no layers to apply.", 4000)
             return
         if self._raster_worker is not None and self._raster_worker.isRunning():
+            self.statusBar().showMessage(
+                "Still decoding — layer changes will apply once it finishes. "
+                "Press R again then.", 4000)
             return          # one decode at a time; it is expensive enough
 
         hidden = conv.hidden_layers()
@@ -1190,18 +1294,25 @@ class MainWindow(QMainWindow):
             0 if not cached else 4000)
 
         worker = _RasterWorker(conv)
-        worker.done.connect(self._on_raster_rendered)
-        worker.err.connect(lambda msg: (
+        worker.done.connect(
+            lambda c, png, ext, sheet, w=worker:
+            self._on_raster_rendered(c, png, ext, sheet)
+            if w is self._raster_worker else None)
+        worker.err.connect(lambda msg, w=worker: (
             self._progress.setVisible(False),
-            self.statusBar().showMessage(f"Render error: {msg}", 4000)))
+            self.statusBar().showMessage(f"Render error: {msg}", 4000))
+            if w is self._raster_worker else None)
         worker.finished.connect(worker.deleteLater)
         self._raster_worker = worker
+        _keep_alive(worker)
         worker.start()
 
-    def _on_raster_rendered(self, conv, png, extents):
+    def _on_raster_rendered(self, conv, png, extents, sheet=None):
         self._progress.setVisible(False)
         if conv is not self._current_conv:
             return          # a different drawing was opened meanwhile
+        if sheet is not None and sheet != conv.current_sheet:
+            return          # rendered for a sheet no longer on screen
         if not self._canvas.load_image(png, extents):
             self.statusBar().showMessage(
                 "The redrawn sheet could not be displayed.", 5000)
@@ -1221,6 +1332,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._flush_markup()
+        self.hide()             # the wait below should not look like a hang
+        _stop_all_workers()
         super().closeEvent(event)
 
     # ------------------------------------------------------------------ #

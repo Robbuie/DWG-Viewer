@@ -448,20 +448,29 @@ class DWGConverter:
         except OSError:
             return False
 
-    def render_raster(self, width_px: int | None = None) -> tuple[bytes, tuple]:
+    def render_raster(self, width_px: int | None = None,
+                      cancel=None) -> tuple[bytes, tuple]:
         """PNG bytes plus the drawing's extents in sheet inches.
 
         Decoding is expensive enough — tens of seconds for a busy
         sheet — that the result is cached at full resolution and reused
         on every later open.
+
+        `cancel` is an optional threading.Event; setting it makes this
+        raise w2d.Cancelled and leaves the cache untouched. The sheet and
+        hidden layers are captured once at the start, so if the UI moves
+        to another sheet mid-decode the result can never be filed in the
+        cache under the wrong sheet.
         """
         from src import w2d_render
+        from src.w2d import Cancelled, check_cancel
 
         width = width_px or w2d_render.DEFAULT_WIDTH
+        sheet = self._sheet
         hidden = self.hidden_layers()
         variant = _cache.raster_variant(hidden)
         cached = _cache.get_cached_raster(self.filepath, width, variant,
-                                          self._sheet)
+                                          sheet)
         if cached:
             try:
                 from PIL import Image
@@ -470,39 +479,53 @@ class DWGConverter:
                     w, h = probe.size
                 # The stored box has to be recovered from the sheet, not
                 # from the PNG, so read it back off the stream cheaply.
-                box = self._inches_box(w, h)
+                box = self._inches_box(w, h, sheet)
                 if box is not None:
                     known = _cache.get_cached_raster_layers(
-                        self.filepath, width, self._sheet)
-                    if known is not None:
+                        self.filepath, width, sheet)
+                    if known is not None and sheet == self._sheet:
                         self._note_classic_layers(known)
                     return cached, box
             except Exception:
                 pass
 
         try:
-            png, box, layers = w2d_render.render_sheet_png(
-                self.filepath, self._sheet, width, hidden)
+            if cancel is None:
+                png, box, layers = w2d_render.render_sheet_png(
+                    self.filepath, sheet, width, hidden)
+            else:
+                png, box, layers = w2d_render.render_sheet_png(
+                    self.filepath, sheet, width, hidden, cancel=cancel)
+        except Cancelled:
+            raise
+        except MemoryError as exc:
+            raise DrawingError(
+                "Not enough memory to decode this DWF sheet. Close other "
+                "drawings or programs and try again.") from exc
         except Exception as exc:
             raise DrawingError(f"Could not decode this DWF sheet: {exc}") from exc
+        check_cancel(cancel)
+        # Layers belong to the sheet that was decoded; if the user has
+        # since moved on they describe nothing on screen.
         # A pass with layers hidden only reports the layers it drew, so
         # the full list is recorded from the unfiltered pass alone.
         if not hidden:
-            self._note_classic_layers(layers)
+            if sheet == self._sheet:
+                self._note_classic_layers(layers)
             try:
                 _cache.store_raster_layers(self.filepath, width, layers,
-                                           self._sheet)
+                                           sheet)
             except Exception:
                 pass
         try:
-            _cache.store_raster(self.filepath, width, png, variant, self._sheet)
+            _cache.store_raster(self.filepath, width, png, variant, sheet)
         except Exception:
             pass
         return png, box
 
     # -- sharp zoom: redraw a region from retained geometry -------------
 
-    def ensure_geometry(self):
+    def ensure_geometry(self, cancel=None):
         """Decode the sheet into retained geometry.
 
         Costs a full pass over the opcode stream, so callers do this once,
@@ -516,7 +539,11 @@ class DWGConverter:
             # so a late arrival is dropped rather than handing the new
             # sheet the old one's geometry and layer names.
             sheet = self._sheet
-            geometry = w2d_render.decode_geometry(self.filepath, sheet)
+            if cancel is None:
+                geometry = w2d_render.decode_geometry(self.filepath, sheet)
+            else:
+                geometry = w2d_render.decode_geometry(self.filepath, sheet,
+                                                      cancel=cancel)
             if sheet != self._sheet:
                 return self._geometry
             self._geometry = geometry
@@ -576,14 +603,16 @@ class DWGConverter:
         img.save(buf, "PNG", compress_level=1)   # speed over size; it is transient
         return buf.getvalue()
 
-    def _inches_box(self, width_px: int, height_px: int):
+    def _inches_box(self, width_px: int, height_px: int,
+                    sheet: int | None = None):
         """Recover the inches box for a cached raster without decoding
         the whole graphics stream again."""
         try:
             from src import dwf as classic
             from src import w2d_render
+            index = self._sheet if sheet is None else sheet
             with classic.ClassicDwf(self.filepath) as doc:
-                href = doc.sheets[self._sheet].first("2d streaming graphics")
+                href = doc.sheets[index].first("2d streaming graphics")
                 if not href:
                     return None
                 real = doc._names.get(href.replace("\\", "/").lstrip("/").lower())

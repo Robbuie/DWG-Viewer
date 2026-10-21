@@ -27,6 +27,9 @@ from src import markup as mk
 from src import theme
 
 
+_LIVE_DETAIL: set = set()
+
+
 class _DetailWorker(QThread):
     """Renders one detail tile off the UI thread.
 
@@ -49,8 +52,8 @@ class _DetailWorker(QThread):
     def run(self):
         try:
             png = self._provider(self._rect, self._base, self._out)
-        except Exception:
-            return
+        except BaseException:
+            return      # a tile is optional; the raster underneath stays
         if png:
             self.done.emit(self._token, png, *self._rect)
 
@@ -288,6 +291,12 @@ class DrawingCanvas(QGraphicsView):
         worker.done.connect(self._on_detail_ready)
         worker.finished.connect(worker.deleteLater)
         self._detail_worker = worker
+        # Zooming starts a tile before the last one has finished, and
+        # overwriting _detail_worker would otherwise let a still-running
+        # QThread be garbage collected, which aborts the whole process.
+        # Held until its thread has finished; the token discards the result.
+        _LIVE_DETAIL.add(worker)
+        worker.finished.connect(lambda w=worker: _LIVE_DETAIL.discard(w))
         worker.start()
 
     def _on_detail_ready(self, token: int, png: bytes,

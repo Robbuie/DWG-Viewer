@@ -147,6 +147,32 @@ def store_png(filepath: Path, data: bytes) -> None:
         _atomic_write(thumb_png_path(filepath), data)
 
 
+# ── Per-sheet thumbnails ──────────────────────────────────────────────
+#
+# A drawing set lists its sheets under the document in the file panel.
+# Each sheet's miniature is cached beside the file's own, keyed the same
+# way, so it goes stale with the file and is pruned with the rest.
+
+def sheet_thumb_png_path(filepath: Path, sheet: int) -> Path:
+    return THUMB_DIR / f"{cache_key(filepath)}.s{int(sheet)}.png"
+
+
+def get_cached_sheet_png(filepath: Path, sheet: int) -> bytes | None:
+    p = sheet_thumb_png_path(filepath, sheet)
+    try:
+        if p.is_file():
+            os.utime(p, None)
+            return p.read_bytes()
+    except OSError:
+        pass
+    return None
+
+
+def store_sheet_png(filepath: Path, sheet: int, data: bytes) -> None:
+    if data:
+        _atomic_write(sheet_thumb_png_path(filepath, sheet), data)
+
+
 # ── Full-resolution raster cache ──────────────────────────────────────
 
 def raster_variant(hidden) -> str:

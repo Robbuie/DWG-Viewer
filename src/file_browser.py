@@ -43,7 +43,7 @@ from PyQt6.QtCore    import (Qt, QRunnable, QThreadPool, pyqtSignal, QObject,
 from PyQt6.QtGui     import QPixmap, QImage, QColor, QIcon, QPainter, QFont
 from PyQt6.QtSvg     import QSvgRenderer
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
-                             QListWidgetItem, QLabel, QPushButton,
+                             QListWidgetItem, QLabel, QPushButton, QToolButton,
                              QFileDialog, QSizePolicy, QLineEdit)
 
 from src import theme
@@ -62,6 +62,25 @@ _PRELOAD_SCREENS   = 1.0
 # the first thumbnail wait for the last file; small batches let results
 # stream in while later batches are still queued.
 _ODA_BATCH_SIZE    = 24
+
+
+# ── "This file only" — remembered across sessions ────────────────────
+
+def _load_file_only() -> bool:
+    try:
+        from src import recent
+        value = recent._settings().value("browser/fileOnly", False)
+        return value in (True, "true", "1", 1)
+    except Exception:
+        return False
+
+
+def _save_file_only(on: bool) -> None:
+    try:
+        from src import recent
+        recent._settings().setValue("browser/fileOnly", bool(on))
+    except Exception:
+        pass
 
 
 # ── Startup cleanup ──────────────────────────────────────────────────
@@ -88,6 +107,74 @@ except Exception:
     _cache = None  # type: ignore[assignment]
 
 
+# Item data. Every tile carries the drawing's path and a key that names
+# its thumbnail; a sheet tile also carries its index within the drawing.
+# File tiles are keyed by the bare path, so everything written before
+# sheets existed still lines up.
+_ROLE_PATH  = Qt.ItemDataRole.UserRole
+_ROLE_SHEET = Qt.ItemDataRole.UserRole + 1
+_ROLE_KEY   = Qt.ItemDataRole.UserRole + 2
+
+
+def sheet_key(filepath: str, sheet: int) -> str:
+    return f"{filepath}#sheet{int(sheet)}"
+
+
+def _sheet_tile_label(index: int, name: str) -> str:
+    # Published sheet names repeat the set's drawing number and end in the
+    # layout name ("DE-3012934-111-002-Model"); the tile is narrow, so the
+    # layout suffix goes and the full name stays in the tooltip.
+    short = name[:-6] if name.lower().endswith("-model") else name
+    return f"{index + 1}.  {short}"
+
+
+def _decorate_sheet(img: QImage, index: int) -> QImage:
+    """Mark a sheet tile as a page of the drawing above it: an accent
+    edge and its page number in the corner."""
+    t = theme.current()
+    out = QImage(_THUMB_W, _THUMB_H, QImage.Format.Format_ARGB32)
+    out.fill(QColor(t["bg-3"]))
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    scaled = img.scaled(_THUMB_W - 6, _THUMB_H - 6,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+    p.drawImage((_THUMB_W - scaled.width()) // 2,
+                (_THUMB_H - scaled.height()) // 2, scaled)
+    p.fillRect(0, 0, 4, _THUMB_H, QColor(t["accent"]))
+    font = QFont()
+    font.setPointSize(9)
+    font.setBold(True)
+    p.setFont(font)
+    text = str(index + 1)
+    w = max(22, p.fontMetrics().horizontalAdvance(text) + 12)
+    chip = QRectF(_THUMB_W - w - 4, 4, w, 18)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(t["accent"]))
+    p.drawRoundedRect(chip, 9, 9)
+    p.setPen(QColor(t["accent-text"]))
+    p.drawText(chip, Qt.AlignmentFlag.AlignCenter, text)
+    p.end()
+    return out
+
+
+def sheet_count(filepath: str) -> int:
+    """Sheets in a published set; 1 for anything that is not one."""
+    suffix = Path(filepath).suffix.lower()
+    try:
+        if suffix in (".dwf", ".dwfx"):
+            from src import dwfx
+            if dwfx.is_dwfx_package(filepath):
+                with dwfx.DwfxDocument(filepath) as doc:
+                    return len(doc.sheets)
+            from src import dwf as classic
+            with classic.ClassicDwf(filepath) as doc:
+                return doc.sheet_count
+    except Exception:
+        pass
+    return 1
+
+
 # ── Shared signal carrier ────────────────────────────────────────────
 
 class _Signals(QObject):
@@ -97,7 +184,8 @@ class _Signals(QObject):
     with a few hundred files that is a few hundred allocations and
     cross-thread connections before any drawing is read.
     """
-    done = pyqtSignal(int, str, QImage, int)  # generation, path, image, rank
+    done = pyqtSignal(int, str, QImage, int)  # generation, key, image, rank
+    counted = pyqtSignal(int, str, int)       # generation, path, sheets
 
 
 # Result quality. Workers race — the fast placeholder path can finish
@@ -457,12 +545,82 @@ class _DwfThumbWorker(QRunnable):
         return img
 
 
+# ── Worker 5: one sheet of a drawing set ─────────────────────────────
+
+class _SheetThumbWorker(QRunnable):
+    """Miniature of one sheet: the plot preview a classic DWF carries for
+    every sheet, or a small render of a DWFx sheet."""
+
+    def __init__(self, gen: int, key: str, filepath: str, sheet: int,
+                 signals: _Signals, is_current):
+        super().__init__()
+        self.gen, self.key, self.filepath, self.sheet = gen, key, filepath, sheet
+        self.signals, self._is_current = signals, is_current
+        self.setAutoDelete(True)
+
+    def run(self):
+        if not self._is_current(self.gen):
+            return
+        path = Path(self.filepath)
+        try:
+            data = _cache.get_cached_sheet_png(path, self.sheet) if _cache else None
+            if data:
+                img = QImage()
+                if img.loadFromData(QByteArray(data), "PNG") and not img.isNull():
+                    self.signals.done.emit(self.gen, self.key, img, _RANK_FINAL)
+                    return
+            img = self._build()
+            if img is None or img.isNull():
+                return
+            if _cache:
+                try:
+                    _cache.store_sheet_png(path, self.sheet, _image_to_png_bytes(img))
+                except Exception:
+                    pass
+            self.signals.done.emit(self.gen, self.key, img, _RANK_FINAL)
+        except Exception:
+            pass
+
+    def _build(self) -> QImage | None:
+        from src import dwfx
+        w, h = _THUMB_W * _RENDER_SCALE, _THUMB_H * _RENDER_SCALE
+        if dwfx.is_dwfx_package(self.filepath):
+            svg = dwfx.render_sheet_svg(self.filepath, self.sheet, w, h)
+            return _svg_to_image(svg, w, h) if svg else None
+        from src import dwf as classic
+        with classic.ClassicDwf(self.filepath) as doc:
+            data = doc.thumbnail_png(self.sheet)
+        if not data:
+            return None
+        img = QImage()
+        return img if img.loadFromData(QByteArray(data), "PNG") else None
+
+
+class _SheetCountWorker(QRunnable):
+    """Reads how many sheets a DWF or DWFx holds, for the tile label."""
+
+    def __init__(self, gen: int, filepath: str, signals: _Signals, is_current):
+        super().__init__()
+        self.gen, self.filepath = gen, filepath
+        self.signals, self._is_current = signals, is_current
+        self.setAutoDelete(True)
+
+    def run(self):
+        if not self._is_current(self.gen):
+            return
+        n = sheet_count(self.filepath)
+        if n > 1:
+            self.signals.counted.emit(self.gen, self.filepath, n)
+
+
 # ── FileBrowser widget ───────────────────────────────────────────────
 
 class FileBrowser(QWidget):
     """Left panel: folder path bar + scrollable drawing icon grid."""
 
     fileSelected = pyqtSignal(str)
+    sheetSelected = pyqtSignal(str, int)      # path, sheet index
+    fileOnlyChanged = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -488,8 +646,18 @@ class FileBrowser(QWidget):
         self._rank: dict[str, int] = {}      # best result seen per file
         self._pending_dwg: list[str] = []
 
+        # The drawing on the canvas, and — when it is a set — its sheets,
+        # listed as tiles straight after its own.
+        self._open_path: str | None = None
+        self._sheet_names: list[str] = []
+        self._sheet_items: list[QListWidgetItem] = []
+        self._open_sheet = 0
+        self._counts: dict[str, int] = {}
+        self._file_only = _load_file_only()
+
         self._signals = _Signals()
         self._signals.done.connect(self._on_done)
+        self._signals.counted.connect(self._on_counted)
 
         self._build_ui()
 
@@ -528,6 +696,18 @@ class FileBrowser(QWidget):
         btn.setToolTip("Browse for folder")
         btn.clicked.connect(self._browse)
         row.addWidget(btn)
+
+        self._only_btn = QToolButton()
+        self._only_btn.setText("📄")
+        self._only_btn.setCheckable(True)
+        self._only_btn.setChecked(self._file_only)
+        self._only_btn.setFixedWidth(32)
+        self._only_btn.setToolTip(
+            "This file only — show just the open drawing and its sheets "
+            "instead of the whole folder. The arrow keys then page through "
+            "its sheets.")
+        self._only_btn.toggled.connect(self.set_file_only)
+        row.addWidget(self._only_btn)
         lay.addLayout(row)
 
         self._count = QLabel("No folder selected")
@@ -581,6 +761,127 @@ class FileBrowser(QWidget):
         self._list.scrollToItem(item)
         return True
 
+    # ── Sheets of the open drawing ───────────────────────────────────
+
+    @property
+    def file_only(self) -> bool:
+        return self._file_only
+
+    def set_file_only(self, on: bool) -> None:
+        """Show only the open drawing (and its sheets), or the folder."""
+        on = bool(on)
+        if self._only_btn.isChecked() != on:
+            self._only_btn.blockSignals(True)
+            self._only_btn.setChecked(on)
+            self._only_btn.blockSignals(False)
+        if on == self._file_only:
+            return
+        self._file_only = on
+        _save_file_only(on)
+        self._refresh()
+        self.fileOnlyChanged.emit(on)
+
+    def set_open_document(self, filepath: str | None,
+                          sheet_names: list[str] | None = None,
+                          current: int = 0) -> None:
+        """Tell the panel which drawing is on the canvas.
+
+        Called once as the file starts opening (no sheets yet) and again
+        when it has loaded and its sheets are known. A set gets one tile
+        per sheet beneath its own; anything else has none.
+        """
+        fp = str(Path(filepath)) if filepath else None
+        names = list(sheet_names or [])
+        if len(names) < 2:
+            names = []
+        changed_file = fp != self._open_path
+        self._open_path = fp
+        self._sheet_names = names
+        self._open_sheet = current if 0 <= current < len(names) else 0
+        if fp and names:
+            self._counts[fp] = len(names)
+        if self._file_only and changed_file:
+            self._refresh()
+            return
+        self._rebuild_sheet_items()
+
+    def set_current_sheet(self, index: int) -> None:
+        """Highlight the sheet now on the canvas."""
+        if not 0 <= index < len(self._sheet_items):
+            return
+        self._open_sheet = index
+        item = self._sheet_items[index]
+        self._list.setCurrentItem(item)
+        self._list.scrollToItem(item)
+
+    def sheet_count_of(self, filepath: str) -> int:
+        return self._counts.get(str(Path(filepath)), 1)
+
+    def _remove_sheet_items(self) -> None:
+        for item in self._sheet_items:
+            row = self._list.row(item)
+            if row >= 0:
+                self._list.takeItem(row)
+            key = item.data(_ROLE_KEY)
+            self._items.pop(key, None)
+            self._requested.discard(key)
+            self._rank.pop(key, None)
+        self._sheet_items = []
+
+    def _rebuild_sheet_items(self) -> None:
+        self._remove_sheet_items()
+        fp = self._open_path
+        parent = self._items.get(fp) if fp else None
+        if parent is None or not self._sheet_names:
+            if parent is not None:
+                self._list.setCurrentItem(parent)
+            self._update_count()
+            return
+
+        row = self._list.row(parent) + 1
+        icon = QIcon(_plain_pixmap())
+        hint = QSize(_THUMB_W + 16, _THUMB_H + 32)
+        for i, name in enumerate(self._sheet_names):
+            key = sheet_key(fp, i)
+            item = QListWidgetItem(icon, _sheet_tile_label(i, name))
+            item.setData(_ROLE_PATH, fp)
+            item.setData(_ROLE_SHEET, i)
+            item.setData(_ROLE_KEY, key)
+            item.setSizeHint(hint)
+            item.setToolTip(f"Sheet {i + 1} of {len(self._sheet_names)}\n{name}")
+            self._list.insertItem(row + i, item)
+            self._items[key] = item
+            self._sheet_items.append(item)
+        self._set_tile_label(fp)
+        self.set_current_sheet(self._open_sheet)
+        self._update_count()
+        self._schedule_scan()
+
+    def _set_tile_label(self, fp: str) -> None:
+        item = self._items.get(fp)
+        n = self._counts.get(fp, 1)
+        if item is not None and n > 1:
+            item.setText(f"{Path(fp).name}\n{n} sheets")
+
+    def _on_counted(self, gen: int, fp: str, n: int) -> None:
+        if gen != self._gen:
+            return
+        self._counts[fp] = n
+        self._set_tile_label(fp)
+
+    def _update_count(self) -> None:
+        files = len(self._file_rows())
+        if self._file_only and self._open_path:
+            n = len(self._sheet_names)
+            self._count.setText(
+                f"This file only · {n} sheets" if n else "This file only")
+        elif files:
+            self._count.setText(f"{files} file{'s' if files != 1 else ''}")
+
+    def _file_rows(self) -> list[int]:
+        return [i for i in range(self._list.count())
+                if self._list.item(i).data(_ROLE_SHEET) is None]
+
     def _browse(self):
         start = str(self._folder) if self._folder else ""
         f = QFileDialog.getExistingDirectory(self, "Select drawing folder", start)
@@ -588,26 +889,44 @@ class FileBrowser(QWidget):
             self.open_folder(f)
 
     def _on_activated(self, item: QListWidgetItem):
-        fp = item.data(Qt.ItemDataRole.UserRole)
-        if fp:
+        fp = item.data(_ROLE_PATH)
+        if not fp:
+            return
+        sheet = item.data(_ROLE_SHEET)
+        if sheet is None:
             self.fileSelected.emit(fp)
+        else:
+            self.sheetSelected.emit(fp, int(sheet))
 
     def select_next(self, delta: int) -> None:
-        """Move selection by delta (+1 = next, -1 = previous) and open the file."""
-        count = self._list.count()
+        """Move selection by delta (+1 = next, -1 = previous) and open the file.
+
+        Steps over drawings only: the sheet tiles listed under an open set
+        are pages of it, not neighbours in the folder.
+        """
+        rows = self._file_rows()
+        count = len(rows)
         if count == 0:
             return
-        current = self._list.currentRow()
+        # Where we are, as a position among the file tiles. A sheet tile
+        # counts as its drawing.
+        current = -1
+        if self._open_path and self._open_path in self._items:
+            current = rows.index(self._list.row(self._items[self._open_path])) \
+                if self._list.row(self._items[self._open_path]) in rows else -1
+        if current < 0:
+            row = self._list.currentRow()
+            current = rows.index(row) if row in rows else -1
         if current < 0:
             current = 0 if delta > 0 else count
-        new_row = max(0, min(count - 1, current + delta))
-        if new_row == current and 0 <= current < count:
+        new = max(0, min(count - 1, current + delta))
+        if new == current and 0 <= current < count:
             return
-        self._list.setCurrentRow(new_row)
-        item = self._list.item(new_row)
+        item = self._list.item(rows[new])
         if item:
+            self._list.setCurrentItem(item)
             self._list.scrollToItem(item)
-            fp = item.data(Qt.ItemDataRole.UserRole)
+            fp = item.data(_ROLE_PATH)
             if fp:
                 self.fileSelected.emit(fp)
 
@@ -627,6 +946,7 @@ class FileBrowser(QWidget):
         self._requested.clear()
         self._rank.clear()
         self._pending_dwg.clear()
+        self._sheet_items = []
 
         if not (self._folder and self._folder.is_dir()):
             self._count.setText("Folder not found")
@@ -641,12 +961,12 @@ class FileBrowser(QWidget):
             self._count.setText("Folder not readable")
             return
 
+        if self._file_only and self._open_path:
+            files = [f for f in files if str(f) == self._open_path]
+
         if not files:
             self._count.setText("No drawing files found")
             return
-
-        n = len(files)
-        self._count.setText(f"{n} file{'s' if n != 1 else ''}")
 
         # Populate the grid with placeholders only. This is pure UI work
         # and completes immediately even for very large folders; no file
@@ -657,12 +977,15 @@ class FileBrowser(QWidget):
         for f in files:
             fp = str(f)
             item = QListWidgetItem(icon, f.name)
-            item.setData(Qt.ItemDataRole.UserRole, fp)
+            item.setData(_ROLE_PATH, fp)
+            item.setData(_ROLE_KEY, fp)
             item.setSizeHint(hint)
             item.setToolTip(fp)
             self._list.addItem(item)
             self._items[fp] = item
+            self._set_tile_label(fp)
 
+        self._rebuild_sheet_items()
         self._schedule_scan()
 
     # ── Viewport-driven loading ──────────────────────────────────────
@@ -695,11 +1018,17 @@ class FileBrowser(QWidget):
                 continue
             if r.top() > window.bottom():
                 break                      # laid out in order — nothing further is near
-            fp = item.data(Qt.ItemDataRole.UserRole)
-            if not fp or fp in self._requested:
+            key = item.data(_ROLE_KEY)
+            if not key or key in self._requested:
                 continue
-            self._requested.add(fp)
-            if self._dispatch(gen, fp):
+            self._requested.add(key)
+            sheet = item.data(_ROLE_SHEET)
+            if sheet is not None:
+                self._render_pool.start(_SheetThumbWorker(
+                    gen, key, item.data(_ROLE_PATH), int(sheet),
+                    self._signals, self._is_current))
+                continue
+            if self._dispatch(gen, key):
                 queued_dwg = True
 
         if queued_dwg:
@@ -708,6 +1037,11 @@ class FileBrowser(QWidget):
     def _dispatch(self, gen: int, fp: str) -> bool:
         """Start work for one file. Returns True if it needs ODA."""
         path = Path(fp)
+
+        # Sets say how many sheets they hold on their tile.
+        if path.suffix.lower() in (".dwf", ".dwfx") and fp not in self._counts:
+            self._io_pool.start(
+                _SheetCountWorker(gen, fp, self._signals, self._is_current))
 
         # 1. Cached PNG — by far the common case after the first visit.
         if _cache is not None and _cache.has_cached_png(path):
@@ -765,7 +1099,10 @@ class FileBrowser(QWidget):
         if item is None:
             return
         self._rank[fp] = rank
-        if img.width() > _THUMB_W or img.height() > _THUMB_H:
+        sheet = item.data(_ROLE_SHEET)
+        if sheet is not None:
+            img = _decorate_sheet(img, int(sheet))
+        elif img.width() > _THUMB_W or img.height() > _THUMB_H:
             img = img.scaled(_THUMB_W, _THUMB_H,
                              Qt.AspectRatioMode.KeepAspectRatio,
                              Qt.TransformationMode.SmoothTransformation)

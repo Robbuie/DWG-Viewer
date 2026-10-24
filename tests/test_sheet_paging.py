@@ -171,3 +171,90 @@ def test_controls_hidden_for_a_single_sheet():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── sheets in the file panel ─────────────────────────────────────────
+
+def _browser_with(tmp_path, names=("a.dxf", "b.dwf", "c.dxf")):
+    from src.file_browser import FileBrowser
+    for n in names:
+        (tmp_path / n).write_bytes(b"")
+    fb = FileBrowser()
+    fb._file_only = False
+    fb._only_btn.setChecked(False)
+    fb._load_visible = lambda: None        # no thumbnail work in tests
+    fb.open_folder(tmp_path)
+    return fb
+
+
+def _texts(fb):
+    return [fb._list.item(i).text() for i in range(fb._list.count())]
+
+
+def test_open_set_lists_its_sheets_under_it(tmp_path):
+    fb = _browser_with(tmp_path)
+    b = str(tmp_path / "b.dwf")
+    fb.set_open_document(b, ["S-000-Model", "S-001-Model", "S-002-Model"], 1)
+    texts = _texts(fb)
+    assert texts[0] == "a.dxf"
+    assert texts[1] == "b.dwf\n3 sheets"
+    assert texts[2:5] == ["1.  S-000", "2.  S-001", "3.  S-002"]
+    assert texts[5] == "c.dxf"
+    assert fb._list.currentItem() is fb._sheet_items[1]
+
+    got = []
+    fb.sheetSelected.connect(lambda p, i: got.append((p, i)))
+    fb._on_activated(fb._sheet_items[2])
+    assert got == [(b, 2)]
+
+    fb.set_current_sheet(0)
+    assert fb._list.currentItem() is fb._sheet_items[0]
+
+    # Opening something that is not a set takes the sheet tiles away.
+    fb.set_open_document(str(tmp_path / "c.dxf"))
+    assert _texts(fb) == ["a.dxf", "b.dwf\n3 sheets", "c.dxf"]
+
+
+def test_next_and_previous_skip_sheet_tiles(tmp_path):
+    fb = _browser_with(tmp_path)
+    b = str(tmp_path / "b.dwf")
+    fb.set_open_document(b, ["x", "y", "z"], 2)
+    opened = []
+    fb.fileSelected.connect(opened.append)
+    fb.select_next(1)
+    assert opened == [str(tmp_path / "c.dxf")]
+    fb.set_open_document(b, ["x", "y", "z"], 0)
+    fb.select_next(-1)
+    assert opened[-1] == str(tmp_path / "a.dxf")
+
+
+def test_file_only_shows_just_the_open_drawing(tmp_path):
+    fb = _browser_with(tmp_path)
+    b = str(tmp_path / "b.dwf")
+    fb.set_open_document(b, ["x", "y"], 0)
+    fb.set_file_only(True)
+    try:
+        assert _texts(fb) == ["b.dwf\n2 sheets", "1.  x", "2.  y"]
+        assert "This file only" in fb._count.text()
+        fb.set_open_document(str(tmp_path / "a.dxf"))
+        assert _texts(fb) == ["a.dxf"]
+        fb.set_file_only(False)
+        assert _texts(fb) == ["a.dxf", "b.dwf\n2 sheets", "c.dxf"]
+    finally:
+        fb.set_file_only(False)
+
+
+def test_arrows_page_sheets_when_file_only():
+    w = _window()
+    w._sheet_box.blockSignals(True)
+    w._sheet_box.addItems(["a", "b", "c"])
+    w._sheet_box.setCurrentIndex(0)
+    w._sheet_box.blockSignals(False)
+    w._browser._file_only = True
+    try:
+        stepped = []
+        w._step_sheet = stepped.append
+        w._navigate_file(1)
+        assert stepped == [1]
+    finally:
+        w._browser._file_only = False

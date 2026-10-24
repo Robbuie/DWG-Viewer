@@ -247,6 +247,9 @@ class MainWindow(QMainWindow):
         # Left: file browser
         self._browser = FileBrowser()
         self._browser.fileSelected.connect(self._open_file)
+        self._browser.sheetSelected.connect(self._open_sheet_from_browser)
+        self._browser.fileOnlyChanged.connect(self._on_file_only_changed)
+        self._pending_sheet: int | None = None
         splitter.addWidget(self._browser)
 
         # Centre: drawing canvas
@@ -332,12 +335,14 @@ class MainWindow(QMainWindow):
 
         # Prev / Next file navigation
         act_prev = QAction("◀  Prev", self)
-        act_prev.setToolTip("Previous file (Left arrow)")
+        act_prev.setToolTip("Previous file (Left arrow) — or previous sheet "
+                            "when the file panel shows this file only")
         act_prev.triggered.connect(lambda: self._navigate_file(-1))
         tb.addAction(act_prev)
 
         act_next = QAction("▶  Next", self)
-        act_next.setToolTip("Next file (Right arrow)")
+        act_next.setToolTip("Next file (Right arrow) — or next sheet "
+                            "when the file panel shows this file only")
         act_next.triggered.connect(lambda: self._navigate_file(1))
         tb.addAction(act_next)
 
@@ -1026,7 +1031,28 @@ class MainWindow(QMainWindow):
             self._act_nav.blockSignals(False)
 
     def _navigate_file(self, delta: int):
+        # With the panel narrowed to one drawing there are no neighbours
+        # to step to, so the arrows page through its sheets instead.
+        if self._browser.file_only and self._sheet_box.count() > 1:
+            self._step_sheet(delta)
+            return
         self._browser.select_next(delta)
+
+    def _open_sheet_from_browser(self, filepath: str, sheet: int) -> None:
+        """A sheet tile was picked in the file panel."""
+        conv = self._current_conv
+        if conv is not None and str(conv.filepath) == str(Path(filepath)):
+            if 0 <= sheet < self._sheet_box.count():
+                self._sheet_box.setCurrentIndex(sheet)
+            return
+        # Still loading, or another drawing: open it and land on the sheet.
+        self._pending_sheet = sheet
+        self._open_file(filepath)
+
+    def _on_file_only_changed(self, on: bool) -> None:
+        self.statusBar().showMessage(
+            "Showing this file only — the arrow keys page through its sheets."
+            if on else "Showing the whole folder.", 4000)
 
     def _rerender(self):
         if self._current_conv is None:
@@ -1039,6 +1065,7 @@ class MainWindow(QMainWindow):
 
     def _open_file(self, filepath: str):
         recent.add_file(filepath)
+        self._browser.set_open_document(filepath)
         # Whatever the previous drawing still had running is asked to
         # stop; its results are ignored if they arrive anyway.
         for worker in (self._load_worker, self._raster_worker,
@@ -1098,6 +1125,7 @@ class MainWindow(QMainWindow):
                           layer_note: str = ""):
         self._current_conv = conv
         self._populate_sheets(conv)
+        self._browser.set_open_document(str(conv.filepath), conv.sheet_names(), 0)
         self._layers.populate(layers, layer_note or None)
         self._canvas.set_detail_provider(None)
         if png:
@@ -1125,6 +1153,10 @@ class MainWindow(QMainWindow):
 
         if png and conv.is_raster:
             self._start_geometry(conv)
+
+        pending, self._pending_sheet = self._pending_sheet, None
+        if pending and 0 < pending < self._sheet_box.count():
+            self._sheet_box.setCurrentIndex(pending)
 
     def _start_geometry(self, conv: DWGConverter) -> None:
         """Decode geometry behind the drawing so deep zoom can be redrawn
@@ -1202,6 +1234,7 @@ class MainWindow(QMainWindow):
 
     def _on_sheet_changed(self, index: int):
         self._update_sheet_steps()
+        self._browser.set_current_sheet(index)
         conv = self._current_conv
         if conv is None or index < 0:
             return
@@ -1272,6 +1305,7 @@ class MainWindow(QMainWindow):
         self._start_geometry(conv)
 
     def _on_load_error(self, message: str):
+        self._pending_sheet = None
         self._progress.setVisible(False)
         self._file_label.setText("Error loading file")
         QMessageBox.critical(

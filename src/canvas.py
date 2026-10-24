@@ -251,7 +251,10 @@ class DrawingCanvas(QGraphicsView):
         self._clear_detail()
         self._nav_token += 1
         if provider is not None:
-            self._schedule_detail()
+            # No zoom burst to wait out here: the sheet has just arrived,
+            # so its sharp tile is wanted now, not after the debounce.
+            self._detail_timer.stop()
+            self._request_detail()
             self._request_nav_thumb()
 
     def _request_nav_thumb(self) -> None:
@@ -885,12 +888,64 @@ class DrawingCanvas(QGraphicsView):
                 if item.isVisible():
                     item.setVisible(False)
                     hidden.append(item)
+        # A sheet with retained geometry is drawn fresh at the output's
+        # own resolution. Otherwise a print or snapshot would carry
+        # whatever is on screen: the raster, or a detail tile made for
+        # the monitor — both far coarser than a page at 600 dpi.
+        vector = self._vector_image(source, target)
+        if vector is not None:
+            image, where = vector
+            for item in (self._svg_item, self._detail_item):
+                if item is not None and item.isVisible():
+                    item.setVisible(False)
+                    hidden.append(item)
+            painter.drawImage(where, image)
         try:
             self._scene.render(painter, target, source,
                                Qt.AspectRatioMode.IgnoreAspectRatio)
         finally:
             for item in hidden:
                 item.setVisible(True)
+
+    _VECTOR_MAX_PX = 12000
+
+    def _vector_image(self, source: QRectF, target: QRectF):
+        """Redraw the sheet inside `source` from geometry at the pixel size
+        it will occupy in `target`. Returns (image, where-in-target), or
+        None when there is no geometry or the region is too busy."""
+        provider = self._detail_provider
+        base = self._svg_item
+        if provider is None or not isinstance(base, QGraphicsPixmapItem):
+            return None
+        if source.width() <= 0 or source.height() <= 0:
+            return None
+        rect = source.intersected(base.boundingRect())
+        if rect.isEmpty():
+            return None
+        kx = target.width() / source.width()
+        ky = target.height() / source.height()
+        where = QRectF(target.left() + (rect.left() - source.left()) * kx,
+                       target.top() + (rect.top() - source.top()) * ky,
+                       rect.width() * kx, rect.height() * ky)
+        w, h = where.width(), where.height()
+        if w < 2 or h < 2:
+            return None
+        if max(w, h) > self._VECTOR_MAX_PX:
+            k = self._VECTOR_MAX_PX / max(w, h)
+            w, h = w * k, h * k
+        base_rect = base.boundingRect()
+        try:
+            png = provider((rect.left(), rect.top(), rect.right(), rect.bottom()),
+                           (base_rect.width(), base_rect.height()),
+                           (int(w), int(h)))
+        except Exception:
+            return None
+        if not png:
+            return None
+        img = QImage()
+        if not img.loadFromData(QByteArray(png), "PNG") or img.isNull():
+            return None
+        return img, where
 
     # ------------------------------------------------------------------ #
     #  Markup (redlines)
@@ -1274,8 +1329,7 @@ class DrawingCanvas(QGraphicsView):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         try:
-            self._scene.render(painter, QRectF(0, 0, w, h), scene_rect,
-                               Qt.AspectRatioMode.IgnoreAspectRatio)
+            self.render_scene(painter, QRectF(0, 0, w, h), scene_rect)
         finally:
             painter.end()
         return image

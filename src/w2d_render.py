@@ -40,6 +40,12 @@ from src.w2d import W2dDecoder, layer_label, check_cancel
 # memory while rendering (~500 MB) is what keeps this from going higher.
 DEFAULT_WIDTH = 16000
 
+# Width for a sparse sheet, whose detail is always redrawn from geometry
+# (see converter._choose_raster_width). Enough for the moment before
+# that tile lands and for the overview map; ~0.3 s to make instead of
+# ~4 s, and a tenth of the memory.
+SPARSE_WIDTH = 4800
+
 _VIEW_RE = re.compile(rb"\(View\s+(-?\d+),(-?\d+)\s+(-?\d+),(-?\d+)\)")
 
 

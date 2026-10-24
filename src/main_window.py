@@ -99,6 +99,26 @@ class _GeometryWorker(QThread):
             self.ready.emit(self._conv, self._sheet)
 
 
+class _PrefetchWorker(QThread):
+    """Decodes the sheets either side of the one on screen into the
+    raster cache, so Page Up / Page Down land on a cache read."""
+
+    def __init__(self, conv, sheets):
+        super().__init__()
+        self._conv = conv
+        self._sheets = list(sheets)
+        self.cancel = threading.Event()
+
+    def run(self):
+        for sheet in self._sheets:
+            if self.cancel.is_set():
+                return
+            try:
+                self._conv.prefetch_raster(sheet, cancel=self.cancel)
+            except BaseException:
+                return      # an optimisation; the normal path still works
+
+
 class _RasterWorker(QThread):
     """Re-rasterises a classic DWF with layers hidden.
 
@@ -207,6 +227,7 @@ class MainWindow(QMainWindow):
         self._current_conv: DWGConverter | None = None
         self._load_worker: _LoadWorker | None = None
         self._geometry_worker: _GeometryWorker | None = None
+        self._prefetch_worker: _PrefetchWorker | None = None
         self._raster_worker: _RasterWorker | None = None
         self._render_worker = None
 
@@ -1069,8 +1090,9 @@ class MainWindow(QMainWindow):
         # Whatever the previous drawing still had running is asked to
         # stop; its results are ignored if they arrive anyway.
         for worker in (self._load_worker, self._raster_worker,
-                       self._geometry_worker):
+                       self._geometry_worker, self._prefetch_worker):
             _retire(worker)
+        self._prefetch_worker = None
         self._raster_worker = None
         self._geometry_worker = None
 
@@ -1112,8 +1134,9 @@ class MainWindow(QMainWindow):
         try:
             from src import dwfx, cache, w2d_render
             if dwfx.is_classic_dwf(filepath):
-                if cache.get_cached_raster(Path(filepath),
-                                           w2d_render.DEFAULT_WIDTH) is None:
+                from src.converter import raster_widths
+                if not any(cache.raster_path(Path(filepath), w).is_file()
+                           for w in raster_widths()):
                     return (f"Decoding {name} — first open only, this can take "
                             f"a minute. Later opens are instant.")
         except Exception:
@@ -1185,6 +1208,22 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Sharp zoom ready — the drawing is now redrawn at full detail "
             "as you zoom in." + extra, 5000)
+        self._start_prefetch(conv)
+
+    def _start_prefetch(self, conv: DWGConverter) -> None:
+        """Once a sheet has settled, get its neighbours ready."""
+        _retire(self._prefetch_worker)
+        self._prefetch_worker = None
+        count = len(conv.sheet_names())
+        if not conv.is_raster or count < 2:
+            return
+        cur = conv.current_sheet
+        sheets = [s for s in (cur + 1, cur - 1) if 0 <= s < count]
+        worker = _PrefetchWorker(conv, sheets)
+        worker.finished.connect(worker.deleteLater)
+        self._prefetch_worker = worker
+        _keep_alive(worker)
+        worker.start()
 
     def _show_sheet_controls(self, visible: bool) -> None:
         for action in self._sheet_widgets:
@@ -1258,8 +1297,10 @@ class MainWindow(QMainWindow):
         the sheet that was open, so they are dropped here and rebuilt
         for the new one once it has been decoded.
         """
-        for worker in (self._geometry_worker, self._raster_worker):
+        for worker in (self._geometry_worker, self._raster_worker,
+                       self._prefetch_worker):
             _retire(worker)
+        self._prefetch_worker = None
         self._geometry_worker = None
         self._raster_worker = None
         self._canvas.set_detail_provider(None)

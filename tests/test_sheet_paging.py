@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PyQt6.QtCore import Qt, QByteArray
-    from PyQt6.QtGui import QPixmap
+    from PyQt6.QtGui import QPixmap, QColor
     from PyQt6.QtWidgets import QApplication, QGraphicsPixmapItem
     from PIL import Image, ImageDraw
 except ImportError as exc:                            # pragma: no cover
@@ -258,3 +258,34 @@ def test_arrows_page_sheets_when_file_only():
         assert stepped == [1]
     finally:
         w._browser._file_only = False
+
+
+def test_print_and_snapshot_redraw_from_geometry_at_their_own_size():
+    """With geometry available, a page or snapshot is drawn fresh at its
+    own resolution instead of copying the raster or the screen tile."""
+    from PyQt6.QtGui import QImage, QPainter
+    from PyQt6.QtCore import QRectF
+    c = DrawingCanvas()
+    c.resize(1000, 700)
+    c.show()
+    assert c.load_image(_sparse_raster_png(800, 500), (0, 5, 8, -5))
+    provider = _Provider()
+    c.set_detail_provider(provider)
+    _pump(0.5)
+    provider.calls.clear()
+
+    img = QImage(3200, 2000, QImage.Format.Format_RGB32)
+    p = QPainter(img)
+    c.render_scene(p, QRectF(0, 0, 3200, 2000), QRectF(0, 0, 800, 500))
+    p.end()
+    assert provider.calls and provider.calls[-1][2] == (3200, 2000)
+    # The provider's diagonal is drawn at full size through the centre.
+    assert min(QColor(img.pixel(1600, y)).lightness() for y in range(997, 1004)) < 128
+
+
+def test_no_geometry_means_the_scene_as_drawn():
+    from PyQt6.QtGui import QImage, QPainter
+    from PyQt6.QtCore import QRectF
+    c = DrawingCanvas()
+    assert c.load_image(_sparse_raster_png(800, 500), (0, 5, 8, -5))
+    assert c._vector_image(QRectF(0, 0, 800, 500), QRectF(0, 0, 100, 60)) is None

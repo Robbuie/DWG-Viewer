@@ -158,6 +158,20 @@ class ClassicDwf:
         href = self.sheets[index].first("2d streaming graphics")
         return self.read(href) if href else None
 
+    def graphics_size(self, index: int = 0) -> int | None:
+        """Inflated size of a sheet's W2D stream, read from the zip
+        directory without decompressing anything."""
+        if not 0 <= index < len(self.sheets):
+            return None
+        href = self.sheets[index].first("2d streaming graphics")
+        real = self._names.get(_norm(href)) if href else None
+        if real is None:
+            return None
+        try:
+            return self._zip.getinfo(real).file_size
+        except KeyError:
+            return None
+
     def close(self) -> None:
         try:
             self._zip.close()

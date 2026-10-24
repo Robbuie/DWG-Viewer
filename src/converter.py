@@ -131,6 +131,17 @@ def aci_to_hex(i: int) -> str:
 # improves little — the cached raster is already adequate at that zoom.
 MAX_DETAIL_SEGMENTS = 250_000
 
+# A sheet whose graphics stream is under this is decoded to geometry
+# first to see whether it is sparse enough for a small raster. Above it
+# the probe would itself take seconds, and the sheet is busy anyway.
+SPARSE_PROBE_BYTES = 4 * 1024 * 1024
+
+
+def raster_widths() -> tuple[int, ...]:
+    """Widths a sheet's raster may be cached at, cheapest first."""
+    from src import w2d_render
+    return (w2d_render.SPARSE_WIDTH, w2d_render.DEFAULT_WIDTH)
+
 
 class DrawingError(Exception):
     pass
@@ -218,6 +229,9 @@ class DWGConverter:
         self._dwfx: dwfx.DwfxDocument | None = None
         self._classic: bool = False
         self._geometry = None          # decoded W2D geometry, once asked for
+        # Geometry decoded ahead of time for neighbouring sheets, by
+        # prefetch_raster, so paging onto one skips its decode.
+        self._prefetched: dict[int, object] = {}
         self._sheet: int = 0
         # Classic DWF names its layers only inside the opcode stream, so
         # they are not known until a decode pass has run. None means "not
@@ -439,14 +453,45 @@ class DWGConverter:
         applying it costs nothing rather than a minute of decoding."""
         if not self._classic:
             return False
-        from src import w2d_render
-        width = width_px or w2d_render.DEFAULT_WIDTH
         variant = _cache.raster_variant(self.hidden_layers())
+        widths = [width_px] if width_px else raster_widths()
         try:
-            return _cache.raster_path(self.filepath, width, variant,
-                                      self._sheet).is_file()
+            return any(_cache.raster_path(self.filepath, w, variant,
+                                          self._sheet).is_file()
+                       for w in widths)
         except OSError:
             return False
+
+    def _choose_raster_width(self, sheet: int, cancel=None) -> int:
+        """How wide to rasterise a sheet that is not cached yet.
+
+        The full 16000 px exists for busy sheets, where the raster is
+        what you look at until you are well zoomed in. A sparse sheet —
+        a schematic, an index, a title block — is redrawn from geometry
+        at every zoom, so its raster is only a backdrop for the moment
+        before that happens; at full width it costs three or four
+        seconds of PNG encoding and decoding per page for nothing. Its
+        geometry is cheap, so it is decoded first to find out, and kept
+        for the sharp-zoom pass that would decode it anyway.
+        """
+        from src import w2d_render
+        try:
+            from src import dwf as classic
+            with classic.ClassicDwf(self.filepath) as doc:
+                size = doc.graphics_size(sheet)
+        except Exception:
+            size = None
+        if size is None or size > SPARSE_PROBE_BYTES:
+            return w2d_render.DEFAULT_WIDTH
+        try:
+            geom = self.ensure_geometry(cancel=cancel)
+        except Exception:
+            return w2d_render.DEFAULT_WIDTH
+        if geom is None or sheet != self._sheet:
+            return w2d_render.DEFAULT_WIDTH
+        if len(geom.seg) > MAX_DETAIL_SEGMENTS:
+            return w2d_render.DEFAULT_WIDTH
+        return w2d_render.SPARSE_WIDTH
 
     def render_raster(self, width_px: int | None = None,
                       cancel=None) -> tuple[bytes, tuple]:
@@ -465,12 +510,15 @@ class DWGConverter:
         from src import w2d_render
         from src.w2d import Cancelled, check_cancel
 
-        width = width_px or w2d_render.DEFAULT_WIDTH
         sheet = self._sheet
         hidden = self.hidden_layers()
         variant = _cache.raster_variant(hidden)
-        cached = _cache.get_cached_raster(self.filepath, width, variant,
-                                          sheet)
+        cached = None
+        for width in ([width_px] if width_px else raster_widths()):
+            cached = _cache.get_cached_raster(self.filepath, width, variant,
+                                              sheet)
+            if cached:
+                break
         if cached:
             try:
                 from PIL import Image
@@ -489,6 +537,8 @@ class DWGConverter:
             except Exception:
                 pass
 
+        width = width_px or self._choose_raster_width(sheet, cancel)
+        check_cancel(cancel)
         try:
             if cancel is None:
                 png, box, layers = w2d_render.render_sheet_png(
@@ -523,6 +573,49 @@ class DWGConverter:
             pass
         return png, box
 
+    def prefetch_raster(self, sheet: int, cancel=None) -> bool:
+        """Decode a neighbouring sheet into the raster cache ahead of
+        time, so paging onto it is a cache read.
+
+        Sparse sheets only: they take a fraction of a second. A busy sheet
+        would hold a core and half a gigabyte for a minute on the chance
+        the user pages that way. Touches nothing about the sheet on
+        screen. Returns True if it rendered something.
+        """
+        if not self._classic or not 0 <= sheet < len(self._classic_sheets):
+            return False
+        from src import w2d_render
+        from src.w2d import check_cancel
+        if any(_cache.raster_path(self.filepath, w, "", sheet).is_file()
+               for w in raster_widths()):
+            return False
+        try:
+            from src import dwf as classic
+            with classic.ClassicDwf(self.filepath) as doc:
+                size = doc.graphics_size(sheet)
+        except Exception:
+            return False
+        if size is None or size > SPARSE_PROBE_BYTES:
+            return False
+        geom = w2d_render.decode_geometry(self.filepath, sheet, cancel=cancel)
+        if len(geom.seg) > MAX_DETAIL_SEGMENTS:
+            return False
+        check_cancel(cancel)
+        width = w2d_render.SPARSE_WIDTH
+        png, _box, layers = w2d_render.render_sheet_png(
+            self.filepath, sheet, width, cancel=cancel)
+        try:
+            _cache.store_raster_layers(self.filepath, width, layers, sheet)
+            _cache.store_raster(self.filepath, width, png, "", sheet)
+        except Exception:
+            return False
+        if sheet != self._sheet:
+            # Keep the two most recent; they are a few MB each.
+            self._prefetched[sheet] = geom
+            while len(self._prefetched) > 2:
+                self._prefetched.pop(next(iter(self._prefetched)))
+        return True
+
     # -- sharp zoom: redraw a region from retained geometry -------------
 
     def ensure_geometry(self, cancel=None):
@@ -539,7 +632,10 @@ class DWGConverter:
             # so a late arrival is dropped rather than handing the new
             # sheet the old one's geometry and layer names.
             sheet = self._sheet
-            if cancel is None:
+            geometry = self._prefetched.pop(sheet, None)
+            if geometry is not None:
+                pass
+            elif cancel is None:
                 geometry = w2d_render.decode_geometry(self.filepath, sheet)
             else:
                 geometry = w2d_render.decode_geometry(self.filepath, sheet,
@@ -554,10 +650,9 @@ class DWGConverter:
                 self._note_classic_layers(geometry.layers)
                 try:
                     from src import cache as _c
-                    _c.store_raster_layers(self.filepath,
-                                           w2d_render.DEFAULT_WIDTH,
-                                           geometry.layers,
-                                           sheet)
+                    for width in raster_widths():
+                        _c.store_raster_layers(self.filepath, width,
+                                               geometry.layers, sheet)
                 except Exception:
                     pass
         return self._geometry

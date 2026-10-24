@@ -328,6 +328,94 @@ def test_a_decode_that_lands_after_a_sheet_change_is_dropped(tmp_path=None):
     assert conv.get_layers() == []       # nor the old sheet's layers
 
 
+class _Widths:
+    """Shrink both raster widths so the tests draw postage stamps."""
+
+    def __enter__(self):
+        from src import w2d_render, converter
+        self._saved = (w2d_render.DEFAULT_WIDTH, w2d_render.SPARSE_WIDTH,
+                       converter.MAX_DETAIL_SEGMENTS)
+        w2d_render.DEFAULT_WIDTH, w2d_render.SPARSE_WIDTH = 800, 300
+        return self
+
+    def __exit__(self, *exc):
+        from src import w2d_render, converter
+        (w2d_render.DEFAULT_WIDTH, w2d_render.SPARSE_WIDTH,
+         converter.MAX_DETAIL_SEGMENTS) = self._saved
+
+
+def _width(png: bytes) -> int:
+    with Image.open(io.BytesIO(png)) as img:
+        return img.size[0]
+
+
+def test_a_sparse_sheet_gets_a_small_raster_and_keeps_its_geometry(tmp_path=None):
+    """A sheet light enough to be redrawn from geometry at every zoom does
+    not need the full-width raster, which costs seconds per page."""
+    if not HAVE_RENDER:
+        skip("numpy/Pillow not installed")
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    _sandbox(tmp)
+    path = build_set(tmp / "set.dwf", [("Plan", TWO_LAYERS),
+                                       ("Detail", ONE_LAYER)])
+    with _Widths():
+        conv = DWGConverter(path)
+        conv.load()
+        png, _box = conv.render_raster()
+        assert _width(png) == 300
+        assert conv.has_geometry          # decoded once, kept for sharp zoom
+        assert conv.has_cached_raster()
+        # And a cached open finds it at that width.
+        conv2 = DWGConverter(path)
+        conv2.load()
+        assert _width(conv2.render_raster()[0]) == 300
+
+
+def test_a_busy_sheet_keeps_the_full_width_raster(tmp_path=None):
+    if not HAVE_RENDER:
+        skip("numpy/Pillow not installed")
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    _sandbox(tmp)
+    path = build_set(tmp / "set.dwf", [("Plan", TWO_LAYERS)])
+    with _Widths():
+        from src import converter
+        converter.MAX_DETAIL_SEGMENTS = 0      # everything counts as busy
+        conv = DWGConverter(path)
+        conv.load()
+        assert _width(conv.render_raster()[0]) == 800
+
+
+def test_prefetch_caches_a_neighbour_without_touching_the_sheet_on_screen(
+        tmp_path=None):
+    if not HAVE_RENDER:
+        skip("numpy/Pillow not installed")
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    _sandbox(tmp)
+    path = build_set(tmp / "set.dwf", [("Plan", TWO_LAYERS),
+                                       ("Detail", ONE_LAYER)])
+    with _Widths():
+        conv = DWGConverter(path)
+        conv.load()
+        conv.render_raster()
+        layers_before = conv.get_layers()
+        assert conv.prefetch_raster(1)
+        assert conv.current_sheet == 0
+        assert conv.get_layers() == layers_before
+        assert not conv.prefetch_raster(1)     # already cached: no work
+
+        conv.set_sheet(1)
+        assert conv.has_cached_raster()
+        # The prefetched geometry is handed over rather than decoded again.
+        from src import w2d_render
+        real = w2d_render.decode_geometry
+        w2d_render.decode_geometry = None      # would blow up if called
+        try:
+            assert conv.ensure_geometry() is not None
+        finally:
+            w2d_render.decode_geometry = real
+        assert conv.get_layers()            # the new sheet's own layers
+
+
 # ── standalone runner ────────────────────────────────────────────────
 
 def _main() -> int:

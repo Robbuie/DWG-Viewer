@@ -119,13 +119,15 @@ class DrawingCanvas(QGraphicsView):
         self._svg_viewbox: tuple[float, float, float, float] | None = None  # x, y, w, h
 
         # Detail rendering: a cached raster is fixed at one resolution, so
-        # magnifying past it can only interpolate. When a provider is set,
-        # the visible region is redrawn at the resolution it is actually
-        # being displayed at, and laid over the raster.
+        # magnifying past it can only interpolate and shrinking it washes
+        # thin linework out. When a provider is set, the visible region is
+        # redrawn at the resolution it is actually being displayed at, and
+        # laid over the raster.
         self._detail_provider = None
         self._detail_item: QGraphicsPixmapItem | None = None
         self._detail_worker: "_DetailWorker | None" = None
         self._detail_token = 0
+        self._nav_token = 0
         self._detail_timer = QTimer(self)
         self._detail_timer.setSingleShot(True)
         self._detail_timer.setInterval(220)     # let a burst of zooming settle
@@ -179,6 +181,7 @@ class DrawingCanvas(QGraphicsView):
 
     def load_svg(self, svg_string: str) -> None:
         """Replace the displayed drawing with a new SVG string."""
+        self._nav_token += 1
         self._scene.clear()
         self._svg_item = None
         self._svg_renderer = None
@@ -246,8 +249,50 @@ class DrawingCanvas(QGraphicsView):
         """
         self._detail_provider = provider
         self._clear_detail()
+        self._nav_token += 1
         if provider is not None:
             self._schedule_detail()
+            self._request_nav_thumb()
+
+    def _request_nav_thumb(self) -> None:
+        """Redraw the overview map's miniature from geometry.
+
+        The first miniature is the raster scaled down, which washes a
+        sparse sheet out to a near-blank page just as it does on the
+        canvas. Once geometry is available the whole sheet is redrawn at
+        the miniature's own size instead. A dense sheet is refused by the
+        provider and keeps the scaled raster, which suits it.
+        """
+        provider = self._detail_provider
+        base = self._svg_item
+        if provider is None or not isinstance(base, QGraphicsPixmapItem):
+            return
+        box = base.boundingRect()
+        if box.width() < 1 or box.height() < 1:
+            return
+        max_w, max_h = NavigatorOverlay.thumb_bounds()
+        scale = min(max_w / box.width(), max_h / box.height())
+        out = (max(2, int(round(box.width() * scale))),
+               max(2, int(round(box.height() * scale))))
+        worker = _DetailWorker(
+            self._nav_token, provider,
+            (box.left(), box.top(), box.right(), box.bottom()),
+            (box.width(), box.height()), out)
+        worker.done.connect(self._on_nav_thumb_ready)
+        worker.finished.connect(worker.deleteLater)
+        _LIVE_DETAIL.add(worker)
+        worker.finished.connect(lambda w=worker: _LIVE_DETAIL.discard(w))
+        worker.start()
+
+    def _on_nav_thumb_ready(self, token: int, png: bytes, *_rect) -> None:
+        if (token != self._nav_token or not png
+                or not isinstance(self._svg_item, QGraphicsPixmapItem)):
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(QByteArray(png), "PNG") or pix.isNull():
+            return
+        self._nav.set_drawing(pix, self._content_rect())
+        self._update_navigator_view()
 
     def _clear_detail(self) -> None:
         if self._detail_item is not None:
@@ -268,11 +313,20 @@ class DrawingCanvas(QGraphicsView):
             return
 
         scale = self.transform().m11()
-        if scale <= 1.02:
-            # At or below the raster's own resolution it is already as
-            # sharp as a redraw would be.
+        if 0.98 <= scale <= 1.02:
+            # At the raster's own resolution it is already as sharp as a
+            # redraw would be.
             self._clear_detail()
             return
+        # Shrunk below its own resolution the raster is no better: the
+        # sheet is drawn with one-pixel strokes at ~16000 px across, and
+        # scaling that down to a window averages every line into the white
+        # around it. A sparse sheet — a schematic, a title block, a
+        # drawing index — comes out as a faint grey ghost, with whole
+        # lines of text dropping out where the sampler skips them. A tile
+        # redrawn at screen resolution puts every stroke back at full
+        # strength. Dense sheets are refused by the provider's segment cap
+        # and keep the raster, which looks fine on them anyway.
 
         base_rect = base.boundingRect()
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
@@ -280,8 +334,14 @@ class DrawingCanvas(QGraphicsView):
         if rect.width() < 1 or rect.height() < 1:
             return
 
-        out_w = min(4096, max(2, int(rect.width() * scale)))
-        out_h = min(4096, max(2, int(rect.height() * scale)))
+        # Device pixels, so a scaled display (125 %, 150 %) gets a tile it
+        # can show 1:1 instead of stretching a logical-pixel one.
+        try:
+            dpr = max(1.0, float(self.devicePixelRatioF()))
+        except Exception:
+            dpr = 1.0
+        out_w = min(4096, max(2, int(rect.width() * scale * dpr)))
+        out_h = min(4096, max(2, int(rect.height() * scale * dpr)))
 
         self._detail_token += 1
         worker = _DetailWorker(
@@ -360,6 +420,7 @@ class DrawingCanvas(QGraphicsView):
 
         self._detail_item = None
         self._detail_token += 1
+        self._nav_token += 1
 
         pix = QPixmap()
         if not pix.loadFromData(QByteArray(png_data), "PNG") or pix.isNull():
@@ -378,6 +439,10 @@ class DrawingCanvas(QGraphicsView):
         self._scene.setSceneRect(item.boundingRect())
         self.fit_to_view()
         self._refresh_navigator()
+        if self._detail_provider is not None:
+            # A re-render with layers changed keeps its geometry, so the
+            # sharp miniature can be redrawn straight away.
+            self._request_nav_thumb()
         self._rebuild_markup()
         return True
 
@@ -432,6 +497,7 @@ class DrawingCanvas(QGraphicsView):
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
     def clear(self) -> None:
+        self._nav_token += 1
         self._scene.clear()
         self._svg_item = None
         self._svg_renderer = None

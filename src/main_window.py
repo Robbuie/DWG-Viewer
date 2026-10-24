@@ -420,12 +420,35 @@ class MainWindow(QMainWindow):
         # Sheet picker — hidden unless the file holds a drawing set,
         # which means a published set: a multi-sheet DWFx package or a
         # classic DWF holding more than one plotted sheet.
+        #
+        # Previous / Next sit either side of it, with Page Up / Page Down,
+        # because a set of eighteen sheets is paged through far more often
+        # than it is picked from a list.
+        act_prev = QAction("◀", self)
+        act_prev.setToolTip("Previous sheet (Page Up)")
+        act_prev.setShortcut(QKeySequence(Qt.Key.Key_PageUp))
+        act_prev.triggered.connect(lambda: self._step_sheet(-1))
+        self._act_prev_sheet = act_prev
+
+        act_next = QAction("▶", self)
+        act_next.setToolTip("Next sheet (Page Down)")
+        act_next.setShortcut(QKeySequence(Qt.Key.Key_PageDown))
+        act_next.triggered.connect(lambda: self._step_sheet(1))
+        self._act_next_sheet = act_next
+
         self._sheet_box = QComboBox()
         self._sheet_box.setToolTip("Sheet within this drawing set")
         self._sheet_box.setMinimumWidth(140)
+        self._sheet_box.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._sheet_box.setMaxVisibleItems(30)
         self._sheet_box.currentIndexChanged.connect(self._on_sheet_changed)
+
+        tb.addAction(act_prev)
         self._sheet_action = tb.addWidget(self._sheet_box)
-        self._sheet_action.setVisible(False)
+        tb.addAction(act_next)
+        self._sheet_widgets = [act_prev, self._sheet_action, act_next]
+        self._show_sheet_controls(False)
 
         tb.addSeparator()
 
@@ -1131,18 +1154,54 @@ class MainWindow(QMainWindow):
             "Sharp zoom ready — the drawing is now redrawn at full detail "
             "as you zoom in." + extra, 5000)
 
+    def _show_sheet_controls(self, visible: bool) -> None:
+        for action in self._sheet_widgets:
+            action.setVisible(visible)
+        self._update_sheet_steps()
+
+    def _update_sheet_steps(self) -> None:
+        count = self._sheet_box.count()
+        index = self._sheet_box.currentIndex()
+        multi = count > 1
+        self._act_prev_sheet.setEnabled(multi and index > 0)
+        self._act_next_sheet.setEnabled(multi and 0 <= index < count - 1)
+
+    def _step_sheet(self, delta: int) -> None:
+        """Page to the previous or next sheet of a drawing set."""
+        count = self._sheet_box.count()
+        if count < 2:
+            return
+        index = self._sheet_box.currentIndex() + delta
+        if 0 <= index < count:
+            self._sheet_box.setCurrentIndex(index)
+
+    @staticmethod
+    def sheet_label(index: int, count: int, name: str) -> str:
+        """What the picker shows for a sheet: its place in the set, then
+        its name. Display only — markup is keyed by the bare name."""
+        width = len(str(count))
+        return f"{index + 1:>{width}} / {count}   {name}"
+
     def _populate_sheets(self, conv: DWGConverter | None):
         names = conv.sheet_names() if conv is not None else []
         multi = len(names) > 1
         self._sheet_box.blockSignals(True)
         self._sheet_box.clear()
         if multi:
-            self._sheet_box.addItems(names)
+            self._sheet_box.addItems(
+                [self.sheet_label(i, len(names), n) for i, n in enumerate(names)])
             self._sheet_box.setCurrentIndex(0)
         self._sheet_box.blockSignals(False)
-        self._sheet_action.setVisible(multi)
+        self._show_sheet_controls(multi)
+
+    def _sheet_display_name(self) -> str:
+        conv = self._current_conv
+        names = conv.sheet_names() if conv is not None else []
+        index = self._sheet_box.currentIndex()
+        return names[index] if 0 <= index < len(names) else "this sheet"
 
     def _on_sheet_changed(self, index: int):
+        self._update_sheet_steps()
         conv = self._current_conv
         if conv is None or index < 0:
             return
@@ -1175,7 +1234,7 @@ class MainWindow(QMainWindow):
         self._update_find_status()
 
         cached = conv.has_cached_raster()
-        name = self._sheet_box.currentText() or "this sheet"
+        name = self._sheet_display_name()
         self._progress.setVisible(True)
         self.statusBar().showMessage(
             f"Opening {name} …" if cached else

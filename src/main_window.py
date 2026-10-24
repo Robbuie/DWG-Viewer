@@ -331,11 +331,34 @@ class MainWindow(QMainWindow):
         self._open_btn = open_btn
         tb.addWidget(open_btn)
 
+        # Print — a split button like Open: pressing it prints, and the
+        # arrow beside it offers Save as PDF, which for a drawing set
+        # writes every sheet into one PDF.
         act_print = QAction("🖨  Print", self)
-        act_print.setToolTip("Print the drawing, to scale or fitted (Ctrl+P)")
+        act_print.setToolTip("Print the drawing, to scale or fitted (Ctrl+P) "
+                             "— the arrow saves it as a PDF")
         act_print.setShortcut(QKeySequence("Ctrl+P"))
         act_print.triggered.connect(self._print)
-        tb.addAction(act_print)
+
+        act_pdf = QAction("Save as PDF…", self)
+        act_pdf.setToolTip("Save this sheet, or every sheet of a set, as "
+                           "one PDF (Ctrl+Shift+P)")
+        act_pdf.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        act_pdf.triggered.connect(self._save_pdf)
+        self.addAction(act_pdf)         # so the shortcut works anywhere
+        self._act_pdf = act_pdf
+
+        print_menu = QMenu(self)
+        print_menu.addAction(act_print)
+        print_menu.addAction(act_pdf)
+
+        print_btn = QToolButton(tb)
+        print_btn.setDefaultAction(act_print)
+        print_btn.setMenu(print_menu)
+        print_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        print_btn.setToolButtonStyle(tb.toolButtonStyle())
+        self._print_btn = print_btn
+        tb.addWidget(print_btn)
 
         act_find = QAction("🔍  Find", self)
         act_find.setToolTip("Find text on the sheet (Ctrl+F)")
@@ -620,7 +643,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _print(self) -> None:
-        printing.print_drawing(self, self._canvas)
+        self._flush_markup()
+        printing.print_drawing(self, self._canvas, self._current_conv,
+                               self._markup_store)
+
+    def _save_pdf(self) -> None:
+        self._flush_markup()
+        printing.save_pdf(self, self._canvas, self._current_conv,
+                          self._markup_store)
 
     # ------------------------------------------------------------------ #
     #  Markup toolbar

@@ -661,6 +661,15 @@ class DWGConverter:
     def has_geometry(self) -> bool:
         return self._geometry is not None
 
+    @property
+    def geometry(self):
+        """The current sheet's decoded geometry, or None if not decoded."""
+        return self._geometry
+
+    @property
+    def is_dwfx(self) -> bool:
+        return self._dwfx is not None
+
     def render_detail_png(self, scene_rect, base_size, out_size) -> bytes:
         """Redraw one rectangle of the sheet at an arbitrary resolution.
 

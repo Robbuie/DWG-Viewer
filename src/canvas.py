@@ -124,6 +124,9 @@ class DrawingCanvas(QGraphicsView):
         # redrawn at the resolution it is actually being displayed at, and
         # laid over the raster.
         self._detail_provider = None
+        # Exporting only: draws the sheet's geometry as real vectors onto
+        # a PDF page instead of an image of it. See set_vector_painter.
+        self._vector_painter = None
         self._detail_item: QGraphicsPixmapItem | None = None
         self._detail_worker: "_DetailWorker | None" = None
         self._detail_token = 0
@@ -256,6 +259,17 @@ class DrawingCanvas(QGraphicsView):
             self._detail_timer.stop()
             self._request_detail()
             self._request_nav_thumb()
+
+    def set_vector_painter(self, painter_fn) -> None:
+        """Supply a callable (painter, scene_rect, base_size, target) ->
+        bool that draws the sheet as vectors, or None.
+
+        Only the offscreen canvases that sheet export builds use this.
+        When set, render_scene draws through it in place of the raster,
+        so a classic DWF sheet reaches a PDF as linework rather than as a
+        JPEG of linework. Returning False falls back to the raster.
+        """
+        self._vector_painter = painter_fn
 
     def _request_nav_thumb(self) -> None:
         """Redraw the overview map's miniature from geometry.
@@ -888,11 +902,13 @@ class DrawingCanvas(QGraphicsView):
                 if item.isVisible():
                     item.setVisible(False)
                     hidden.append(item)
-        # A sheet with retained geometry is drawn fresh at the output's
-        # own resolution. Otherwise a print or snapshot would carry
+        # Export to PDF draws real linework straight onto the page.
+        # Otherwise a sheet with retained geometry is drawn fresh at the
+        # output's own resolution, so a print or snapshot does not carry
         # whatever is on screen: the raster, or a detail tile made for
         # the monitor — both far coarser than a page at 600 dpi.
-        vector = self._vector_image(source, target)
+        vectors = self._paint_vectors(painter, source, target, hidden)
+        vector = None if vectors else self._vector_image(source, target)
         if vector is not None:
             image, where = vector
             for item in (self._svg_item, self._detail_item):
@@ -906,6 +922,43 @@ class DrawingCanvas(QGraphicsView):
         finally:
             for item in hidden:
                 item.setVisible(True)
+
+    def _paint_vectors(self, painter: QPainter, source: QRectF,
+                       target: QRectF, hidden: list) -> bool:
+        """Draw the base drawing through the vector painter, if there is
+        one. On success the raster items are added to `hidden` so the
+        scene render that follows paints only what sits on top (markup)."""
+        fn = self._vector_painter
+        base = self._svg_item
+        if fn is None or not isinstance(base, QGraphicsPixmapItem):
+            return False
+        if source.width() <= 0 or source.height() <= 0:
+            return False
+        rect = source.intersected(base.boundingRect())
+        if rect.isEmpty():
+            return False
+        kx = target.width() / source.width()
+        ky = target.height() / source.height()
+        where = QRectF(target.left() + (rect.left() - source.left()) * kx,
+                       target.top() + (rect.top() - source.top()) * ky,
+                       rect.width() * kx, rect.height() * ky)
+        base_rect = base.boundingRect()
+        painter.save()
+        try:
+            painter.setClipRect(target, Qt.ClipOperation.IntersectClip)
+            ok = fn(painter, (rect.left(), rect.top(), rect.right(), rect.bottom()),
+                    (base_rect.width(), base_rect.height()), where)
+        except Exception:
+            ok = False
+        finally:
+            painter.restore()
+        if not ok:
+            return False
+        for item in (base, self._detail_item):
+            if item is not None and item.isVisible():
+                item.setVisible(False)
+                hidden.append(item)
+        return True
 
     _VECTOR_MAX_PX = 12000
 

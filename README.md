@@ -2,7 +2,8 @@
 
 A fast drawing viewer for Windows: folder thumbnails, pan/zoom, layer
 toggles, point-to-point measurement, redline markup, text search,
-printing to scale, and snapshots to the clipboard.
+printing to scale, PDF export of whole drawing sets, and snapshots to
+the clipboard.
 
 ## Supported formats
 
@@ -147,6 +148,7 @@ arguments.
 | `N` | Show / hide the navigator |
 | `Ctrl`+`O` | Open a folder of drawings |
 | `Ctrl`+`P` | Print — to scale or fitted |
+| `Ctrl`+`Shift`+`P` | Save as PDF — this sheet or the whole set |
 | `Ctrl`+`F` | Find text on the sheet |
 | `F3` | Find the next match |
 | `S` | Snapshot — drag a region to the clipboard |
@@ -196,6 +198,31 @@ across as many pages as it needs (a 34x22 sheet becomes 4 across by 3
 down) rather than being silently shrunk. Turning tiling off prints the
 middle of the drawing at the requested scale instead. Either way you can
 print the whole sheet or only what is on screen, with or without markup.
+
+For a drawing set (a multi-sheet DWF or DWFx) the dialog also offers
+**all sheets**. That goes to the printer dialog rather than the preview —
+a preview of eighteen sheets would hold all eighteen at printer
+resolution in memory — and prints each sheet on its own page, or tiled
+when printing at a scale.
+
+### Save as PDF
+
+`Ctrl`+`Shift`+`P`, or the arrow beside **Print**, writes the open sheet
+— or, for a set, every sheet — into one PDF, with each sheet's redlines
+on its own page. Nothing on screen changes while it runs; sheets are
+decoded one at a time in the background, and Cancel stops it without
+leaving a half-written file (or replacing an existing one).
+
+- **Page size.** "Same size as each sheet" gives every page the size of
+  its sheet, so the PDF prints to scale from any reader. Picking a paper
+  instead (Letter, Tabloid, ANSI C/D/E, A4–A0) fits each sheet onto it,
+  turned to suit its shape, or scales and tiles it as printing does.
+- **Classic DWF sheets are vectors**, drawn from the decoded geometry,
+  not a picture of the raster: crisp at any zoom, and no sheet has to be
+  rasterised first just to be exported. A busy sheet of a few million
+  segments takes a few seconds and adds roughly 10 MB.
+- DWG and DXF have one sheet (model space) and no paper size, so they
+  go onto the chosen paper, fitted.
 
 ## Text search
 

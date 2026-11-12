@@ -334,7 +334,7 @@ def test_snapshot_transparency_and_xyz_indicator():
     _pump(0.1)
     lw, lh = v._view.width(), v._view.height()
 
-    clear = v.snapshot(transparent=True, triad=False)
+    clear = v.snapshot(transparent=True, triad=False, crop=False)
     assert (clear.width(), clear.height()) == (lw * 2, lh * 2)   # 2x screen
     assert clear.pixelColor(2, 2).alpha() == 0                   # background
     cx, cy, _ = v.camera.project([[50, 30, 30]])[0]              # the bracket
@@ -342,7 +342,7 @@ def test_snapshot_transparency_and_xyz_indicator():
     assert mid.alpha() == 255
     assert mid.blue() > mid.red(), "selection highlight leaked into the snapshot"
 
-    backdrop = v.snapshot(transparent=False, triad=False)
+    backdrop = v.snapshot(transparent=False, triad=False, crop=False)
     assert backdrop.pixelColor(2, 2).alpha() == 255
 
     # The indicator sits bottom-left; with it off that corner is empty.
@@ -354,11 +354,77 @@ def test_snapshot_transparency_and_xyz_indicator():
                    for x in range(x0 - 10, x0 + 60, 2)
                    for y in range(y0 - 60, y0 + 10, 2))
     assert ink(clear) == 0
-    assert ink(v.snapshot(transparent=True, triad=True)) > 20
+    assert ink(v.snapshot(transparent=True, triad=True, crop=False)) > 20
 
     # Clipboard keeps the alpha: a PNG goes on alongside the bitmap.
     v.copy_to_clipboard()
     assert QApplication.clipboard().mimeData().hasFormat("image/png")
+    v.close()
+
+
+def _alpha(img):
+    a = img.convertToFormat(img.Format.Format_ARGB32)
+    arr = np.frombuffer(a.constBits().asstring(a.sizeInBytes()), np.uint8)
+    return arr.reshape(a.height(), -1, 4)[:, :a.width(), 3]
+
+
+def test_cropped_snapshot_hugs_the_model():
+    from src.model_view import ModelView
+    m = step.load(ASM, use_cache=False)
+    v = ModelView()
+    v.resize(800, 600)
+    v.show()
+    v.set_model(m)
+    v.camera.zoom(0.5)                   # model small in a big window
+    _pump(0.1)
+    img = v.snapshot(transparent=True, triad=False, crop=True)
+    a = _alpha(img)
+    ys, xs = np.nonzero(a)
+    # Long side at least SNAP_MIN_LONG, so a small model is still crisp.
+    assert max(img.width(), img.height()) >= ModelView.SNAP_MIN_LONG - 1
+    # The model reaches to within the margin on every side...
+    for gap in (xs.min(), ys.min(), img.width() - 1 - xs.max(),
+                img.height() - 1 - ys.max()):
+        assert gap <= 0.06 * max(img.width(), img.height()), gap
+    # ...but does not touch the edge.
+    assert xs.min() > 0 and ys.min() > 0
+    # Uncropped, the same view is mostly empty space.
+    full = _alpha(v.snapshot(transparent=True, triad=False, crop=False))
+    assert (full > 0).mean() < (a > 0).mean() / 2
+    v.close()
+
+
+def test_cropped_snapshot_of_a_zoomed_view_is_what_is_on_screen():
+    from src.model_view import ModelView
+    m = step.load(ASM, use_cache=False)
+    v = ModelView()
+    v.resize(800, 600)
+    v.show()
+    v.set_model(m)
+    v.camera.zoom(5)                     # model overflows the window
+    _pump(0.1)
+    lw, lh = v._view.width(), v._view.height()
+    img = v.snapshot(transparent=True, triad=False, crop=True)
+    # Window aspect, give or take the margin: not the whole model.
+    assert abs(img.width() / img.height() - lw / lh) < 0.15
+    v.close()
+
+
+def test_xyz_indicator_gets_its_own_corner_when_cropped():
+    """From the top the plate fills the bottom-left of a cropped image,
+    so the indicator must widen the canvas rather than sit on it."""
+    from src.model_view import ModelView
+    m = step.load(ASM, use_cache=False)
+    v = ModelView()
+    v.resize(800, 600)
+    v.show()
+    v.set_model(m)
+    v.set_view("top")
+    _pump(0.1)
+    plain = v.snapshot(transparent=True, triad=False, crop=True)
+    with_axes = v.snapshot(transparent=True, triad=True, crop=True)
+    assert with_axes.width() > plain.width()
+    assert with_axes.height() == plain.height()
     v.close()
 
 

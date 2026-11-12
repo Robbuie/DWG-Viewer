@@ -9,6 +9,7 @@ from PyQt6.QtCore import QSettings
 
 _CLEAR = "model/snapshotTransparent"
 _TRIAD = "model/snapshotAxes"
+_CROP = "model/snapshotCrop"
 
 
 def transparent() -> bool:
@@ -27,3 +28,12 @@ def set_transparent(on: bool) -> None:
 
 def set_triad(on: bool) -> None:
     QSettings().setValue(_TRIAD, bool(on))
+
+
+def crop() -> bool:
+    """Frame the picture tightly around the model (default on)."""
+    return QSettings().value(_CROP, True, type=bool)
+
+
+def set_crop(on: bool) -> None:
+    QSettings().setValue(_CROP, bool(on))

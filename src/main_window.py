@@ -717,7 +717,10 @@ class MainWindow(QMainWindow):
         self._act_3d_snap_triad = self._hint(
             "Snapshots: Include &XYZ Indicator", self,
             _snap.set_triad, checkable=True)
+        self._act_3d_snap_crop = self._hint(
+            "Snapshots: &Crop to Model", self, _snap.set_crop, checkable=True)
         m.addAction(self._act_3d_snap_clear)
+        m.addAction(self._act_3d_snap_crop)
         m.addAction(self._act_3d_snap_triad)
         m.addSeparator()
         up = m.addMenu("&Up Axis")
@@ -735,6 +738,7 @@ class MainWindow(QMainWindow):
 
         def sync():
             for act, on in ((self._act_3d_snap_clear, _snap.transparent()),
+                            (self._act_3d_snap_crop, _snap.crop()),
                             (self._act_3d_snap_triad, _snap.triad())):
                 act.blockSignals(True)
                 act.setChecked(on)

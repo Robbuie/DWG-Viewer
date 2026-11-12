@@ -62,12 +62,18 @@ back plain numpy triangle meshes.
   clears it. `E` toggles the edge lines.
 * **Snapshots** — `S` or `Ctrl`+`Shift`+`C` copies the view,
   `Ctrl`+`Shift`+`S` saves it as PNG or JPG; the **Snapshot** button on
-  the view's strip does both. Snapshots are re-rendered at twice screen
-  resolution without the selection highlight. By default everything not
+  the view's strip does both. Snapshots are re-rendered, not grabbed
+  off the screen, and leave out the selection highlight. They are
+  **cropped to the model** with a small margin — or to the part of it on
+  screen, when zoomed in on a detail — and rendered at that framing with
+  the long side at least 2000 px (up to 4096), so a model that is small
+  in the window still exports crisply. Turn cropping off to get the
+  whole window at twice its size. With cropping on, the XYZ indicator
+  gets its own corner, widening the picture if the model fills it. By default everything not
   covered by the model is transparent — in a PNG, and on the clipboard
   (a PNG copy goes on alongside the bitmap, which is what Office and
   image editors paste) — and the XYZ indicator is left out. Both are
-  switches under **Snapshot** or **View ▸ 3D Model**, and are
+  switches (with Crop to Model) under **Snapshot** or **View ▸ 3D Model**, and are
   remembered. JPEG cannot hold transparency, so a JPG is flattened onto
   white. Printing, PDF export, measuring,
   markup and text search are sheet tools and are switched off while a

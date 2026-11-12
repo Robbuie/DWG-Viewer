@@ -176,42 +176,51 @@ def _raster(scr, nv, col, w, h, rgba, zbuf, budget: int = 6_000_000):
         nv = np.concatenate([nv[~big], a_n, b_n])
         col = np.concatenate([col[~big], cb, cb])
 
-    # 2. Sample each triangle on a barycentric grid fine enough for its size.
+    # 2. Sample each triangle on a barycentric grid fine enough for its
+    #    size, and 3. keep the nearest sample per pixel. Done in batches
+    #    of a bounded number of samples, each merged into the z-buffer,
+    #    so a 4000-px export does not need gigabytes at once.
     kk = np.clip(np.ceil(_edge_lengths(scr).max(1) / _SPACING_PX), 1, 12).astype(int)
-    lin_all, z_all, rgb_all = [], [], []
-    for k in np.unique(kk):
-        sel = kk == k
-        g = _bary(int(k))
-        pts = np.matmul(g, scr[sel]).reshape(-1, 3)
-        nrm = np.matmul(g, nv[sel]).reshape(-1, 3)
-        c = np.repeat(col[sel], len(g), axis=0)
-        px = np.floor(pts[:, 0]).astype(np.int64)
-        py = np.floor(pts[:, 1]).astype(np.int64)
-        ok = (px >= 0) & (px < w) & (py >= 0) & (py < h)
-        ln = np.linalg.norm(nrm[ok], axis=1)
-        n = nrm[ok] / np.where(ln > 0, ln, 1)[:, None]
-        lam = np.abs(n @ _LIGHT_EYE)                 # two-sided
-        shade = 0.28 + 0.57 * lam + 0.15 * np.abs(n[:, 2])
-        spec = np.clip(np.abs(n @ _HALF_VEC), 0, 1) ** 40 * 0.18
-        lin_all.append(py[ok] * w + px[ok])
-        z_all.append(pts[ok, 2])
-        rgb_all.append(np.clip(c[ok] * shade[:, None] + spec[:, None], 0, 1))
-    if not lin_all:
-        return
-    lin = np.concatenate(lin_all)
-    z = np.concatenate(z_all)
-    rgb = np.concatenate(rgb_all)
-
-    # 3. Nearest sample per pixel (view z grows toward the viewer).
-    order = np.lexsort((-z, lin))
-    lin_s = lin[order]
-    first = np.ones(len(lin_s), bool)
-    first[1:] = lin_s[1:] != lin_s[:-1]
-    win = order[first]
-    zbuf[lin[win]] = z[win]
     flat = rgba.reshape(-1, 4)
-    flat[lin[win], :3] = (rgb[win] * 255).astype(np.uint8)
-    flat[lin[win], 3] = 255
+    for k in np.unique(kk):
+        g = _bary(int(k))
+        sel = np.flatnonzero(kk == k)
+        per = max(1, _SAMPLE_BATCH // len(g))
+        for start in range(0, len(sel), per):
+            idx = sel[start:start + per]
+            pts = np.matmul(g, scr[idx]).reshape(-1, 3)
+            nrm = np.matmul(g, nv[idx]).reshape(-1, 3)
+            c = np.repeat(col[idx], len(g), axis=0)
+            px = np.floor(pts[:, 0]).astype(np.int64)
+            py = np.floor(pts[:, 1]).astype(np.int64)
+            ok = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+            if not ok.any():
+                continue
+            lin = py[ok] * w + px[ok]
+            z = pts[ok, 2]
+            order = np.lexsort((-z, lin))
+            lin_s = lin[order]
+            first = np.ones(len(lin_s), bool)
+            first[1:] = lin_s[1:] != lin_s[:-1]
+            win = order[first]
+            nearer = z[win] > zbuf[lin[win]]
+            win = win[nearer]
+            if not len(win):
+                continue
+            n = nrm[ok][win]
+            ln = np.linalg.norm(n, axis=1)
+            n = n / np.where(ln > 0, ln, 1)[:, None]
+            lam = np.abs(n @ _LIGHT_EYE)                 # two-sided
+            shade = 0.28 + 0.57 * lam + 0.15 * np.abs(n[:, 2])
+            spec = np.clip(np.abs(n @ _HALF_VEC), 0, 1) ** 40 * 0.18
+            rgb = np.clip(c[ok][win] * shade[:, None] + spec[:, None], 0, 1)
+            dest = lin[win]
+            zbuf[dest] = z[win]
+            flat[dest, :3] = (rgb * 255).astype(np.uint8)
+            flat[dest, 3] = 255
+
+
+_SAMPLE_BATCH = 2_000_000
 
 
 def _raster_edges(model, camera, w, h, rgba, zbuf):
@@ -940,12 +949,16 @@ class ModelView(QWidget):
         self._act_snap_clear = smenu.addAction("Transparent Background")
         self._act_snap_clear.setCheckable(True)
         self._act_snap_clear.toggled.connect(self.set_snapshot_transparent)
+        self._act_snap_crop = smenu.addAction("Crop to Model")
+        self._act_snap_crop.setCheckable(True)
+        self._act_snap_crop.toggled.connect(self.set_snapshot_crop)
         self._act_snap_triad = smenu.addAction("Include XYZ Indicator")
         self._act_snap_triad.setCheckable(True)
         self._act_snap_triad.toggled.connect(self.set_snapshot_triad)
 
         def sync():
             for act, on in ((self._act_snap_clear, self.snapshot_transparent()),
+                            (self._act_snap_crop, self.snapshot_crop()),
                             (self._act_snap_triad, self.snapshot_triad())):
                 act.blockSignals(True)
                 act.setChecked(on)
@@ -1038,51 +1051,132 @@ class ModelView(QWidget):
     snapshot_triad = staticmethod(snapshot_prefs.triad)
     set_snapshot_transparent = staticmethod(snapshot_prefs.set_transparent)
     set_snapshot_triad = staticmethod(snapshot_prefs.set_triad)
+    snapshot_crop = staticmethod(snapshot_prefs.crop)
+    set_snapshot_crop = staticmethod(snapshot_prefs.set_crop)
+
+    # Cropped snapshots: the long side is at least this many pixels (so a
+    # small model on screen still exports crisply) and at most the cap.
+    SNAP_MIN_LONG = 2000
+    SNAP_MAX_LONG = 4096
+    SNAP_MAX_LONG_SOFTWARE = 2400       # the numpy renderer is slower
+    SNAP_MARGIN = 0.04                  # of the model's on-screen size
+
+    def _model_rect(self, cam: Camera):
+        """On-screen box (logical px) of the visible geometry, clipped to
+        the window — or None when nothing visible is on screen."""
+        lo = np.array([np.inf, np.inf])
+        hi = -lo
+        for p in self.model.parts:
+            if not p.visible:
+                continue
+            for arr in (p.vertices, p.edges):
+                if len(arr):
+                    xy = cam.project(arr.astype(np.float64))[:, :2]
+                    lo = np.minimum(lo, xy.min(axis=0))
+                    hi = np.maximum(hi, xy.max(axis=0))
+        if not np.isfinite(lo).all():
+            return None
+        x0, y0 = max(lo[0], 0.0), max(lo[1], 0.0)
+        x1, y1 = min(hi[0], cam.width), min(hi[1], cam.height)
+        if x1 - x0 < 1 or y1 - y0 < 1:
+            return None
+        return x0, y0, x1, y1
 
     def snapshot(self, scale: float = 2.0, transparent: bool | None = None,
-                 triad: bool | None = None) -> QImage | None:
+                 triad: bool | None = None, crop: bool | None = None
+                 ) -> QImage | None:
         """The view re-rendered for export.
 
-        At ``scale`` times the window's size, like the sheet snapshots —
-        a picture pasted into a report should not look like a photograph
-        of a monitor. Everything not covered by the model is transparent
-        unless the backdrop is asked for; the XYZ indicator is included
-        only if asked for. The selection highlight is never included:
-        it is a state of the screen, not of the model.
+        Cropped to the model (the default): framed tightly around what
+        is visible of it, with a small margin — zoomed in on a detail,
+        the picture is that detail; zoomed out, it is the model and not
+        the empty window around it. Rendered fresh at that framing, not
+        cut out of a screen-sized picture, so the long side is at least
+        ``SNAP_MIN_LONG`` px. Uncropped, it is the whole window at
+        ``scale`` times its size.
+
+        Everything not covered by the model is transparent unless the
+        backdrop is asked for; the XYZ indicator is included only if
+        asked for. The selection highlight is never included: it is a
+        state of the screen, not of the model.
         """
         if self.model is None:
             return None
         transparent = self.snapshot_transparent() if transparent is None else transparent
         triad = self.snapshot_triad() if triad is None else triad
+        crop = self.snapshot_crop() if crop is None else crop
         lw, lh = max(1, self._view.width()), max(1, self._view.height())
-        w, h = max(1, round(lw * scale)), max(1, round(lh * scale))
         cam = self.camera.copy()
-        cam.resize(lw, lh)                 # framing from the window...
-        big = cam.copy()
-        big.resize(w, h)                   # ...same aspect, more pixels
-        img = None
-        if _GLView is not None and isinstance(self._view, _GLView):
-            img = self._view.render_offscreen(big, w, h)
+        cam.resize(lw, lh)
+        gl = _GLView is not None and isinstance(self._view, _GLView)
+
+        rect = self._model_rect(cam) if crop else None
+        if rect is not None:
+            x0, y0, x1, y1 = rect
+            pad = max(6.0, self.SNAP_MARGIN * max(x1 - x0, y1 - y0))
+            x0, y0, x1, y1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
+            rw, rh = x1 - x0, y1 - y0
+            longest = max(rw, rh)
+            cap = self.SNAP_MAX_LONG if gl else self.SNAP_MAX_LONG_SOFTWARE
+            scale = min(max(scale, self.SNAP_MIN_LONG / longest), cap / longest)
+            big = cam.copy()
+            big.target = cam.unproject((x0 + x1) / 2, (y0 + y1) / 2)
+            big.half_height = (rh / 2) / cam.pixels_per_unit
+            w, h = max(1, round(rw * scale)), max(1, round(rh * scale))
+        else:
+            big = cam.copy()
+            w, h = max(1, round(lw * scale)), max(1, round(lh * scale))
+        big.resize(w, h)
+
+        img = self._view.render_offscreen(big, w, h) if gl else None
         if img is None:
             img = render_image(self.model, big, w, h, background=None,
                                max_triangles=2_000_000,
                                edges=self.show_edges, selected=None)
+
+        if triad:
+            img = self._add_triad(img, cam, scale, own_corner=rect is not None)
         if not transparent:
-            out = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+            out = QImage(img.size(), QImage.Format.Format_ARGB32_Premultiplied)
             p = QPainter(out)
             top, bottom = _theme_background()
             from PyQt6.QtGui import QLinearGradient
-            grad = QLinearGradient(0, 0, 0, h)
+            grad = QLinearGradient(0, 0, 0, out.height())
             grad.setColorAt(0, top)
             grad.setColorAt(1, bottom)
             p.fillRect(out.rect(), grad)
             p.drawImage(0, 0, img)
             p.end()
             img = out
-        if triad:
-            p = QPainter(img)
-            _axis_triad(p, cam, 40, lh - 40, scale=scale)
+        return img
+
+    def _add_triad(self, img: QImage, cam: Camera, scale: float,
+                   own_corner: bool) -> QImage:
+        """Draw the XYZ indicator bottom-left. In a cropped picture the
+        model reaches the edges, so if it would land on the model the
+        canvas grows to the left to give the indicator a corner of its
+        own instead."""
+        box = int(round(80 * scale))
+        ox = 0
+        if own_corner:
+            probe = img.copy(0, max(0, img.height() - box), min(box, img.width()),
+                             min(box, img.height())).convertToFormat(
+                                 QImage.Format.Format_ARGB32)
+            arr = np.frombuffer(probe.constBits().asstring(probe.sizeInBytes()),
+                                np.uint8).reshape(probe.height(), -1, 4)
+            if (arr[:, :probe.width(), 3] > 0).any():
+                ox = box
+        if ox:
+            out = QImage(img.width() + ox, img.height(),
+                         QImage.Format.Format_ARGB32_Premultiplied)
+            out.fill(QColor(0, 0, 0, 0))
+            p = QPainter(out)
+            p.drawImage(ox, 0, img)
             p.end()
+            img = out
+        p = QPainter(img)
+        _axis_triad(p, cam, 40, img.height() / scale - 40, scale=scale)
+        p.end()
         return img
 
     def copy_to_clipboard(self) -> QImage | None:

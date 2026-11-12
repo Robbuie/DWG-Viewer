@@ -33,6 +33,39 @@ hiddenimports += [
     "PyQt6.QtSvg",
 ]
 
+# STEP models: the OpenCascade kernel, from cadquery-ocp-novtk. The
+# whole of OpenCascade is one extension module (OCP.OCP) that registers
+# every OCP.* submodule itself, so only the package and that module need
+# naming. Its DLLs were moved into cadquery_ocp_novtk.libs by delvewheel,
+# and OCP/__init__.py adds that folder — beside the package, one level
+# up — to the DLL search path at import, so they go to the same place
+# here. The vtk-linked "cadquery-ocp" wheel must NOT be used: it needs
+# ~300 MB of VTK this app never calls.
+import glob, importlib.util
+_ocp = importlib.util.find_spec("OCP")
+if _ocp is None or not _ocp.origin:
+    raise SystemExit("cadquery-ocp-novtk is not installed — STEP support "
+                     "would be missing from this build. "
+                     "pip install -r requirements.txt -c constraints-build.txt")
+_ocp_dir = os.path.dirname(_ocp.origin)
+_ocp_libs = os.path.join(os.path.dirname(_ocp_dir), "cadquery_ocp_novtk.libs")
+binaries += collect_dynamic_libs("OCP")
+if os.path.isdir(_ocp_libs):
+    binaries += [(f, "cadquery_ocp_novtk.libs")
+                 for f in glob.glob(os.path.join(_ocp_libs, "*")) if os.path.isfile(f)]
+hiddenimports += ["OCP", "OCP.OCP"]
+
+# The 3D view: QOpenGLWidget plus PyOpenGL for the GL calls. PyOpenGL
+# picks its platform module and array handlers at runtime, so they are
+# named explicitly in case the contrib hook misses one.
+hiddenimports += [
+    "PyQt6.QtOpenGL", "PyQt6.QtOpenGLWidgets",
+    "OpenGL.platform.win32", "OpenGL.arrays.numpymodule",
+    "OpenGL.arrays.ctypesarrays", "OpenGL.arrays.ctypespointers",
+    "OpenGL.arrays.numbers", "OpenGL.arrays.strings", "OpenGL.arrays.lists",
+    "OpenGL.arrays.nones", "OpenGL.arrays.buffers",
+]
+
 # Qt modules this app never touches. Dropping them takes roughly
 # 150-250 MB off the installed size.
 excludes = [
@@ -45,6 +78,8 @@ excludes = [
     "PyQt6.Qt3DRender", "PyQt6.QtMultimedia", "PyQt6.QtMultimediaWidgets",
     "PyQt6.QtBluetooth", "PyQt6.QtNfc", "PyQt6.QtPositioning", "PyQt6.QtSql",
     "PyQt6.QtTest", "PyQt6.QtCharts", "PyQt6.QtDataVisualization",
+    # VTK, in case the vtk-linked OCP wheel is what got installed.
+    "vtk", "vtkmodules",
     # Optional ezdxf backends.
     "matplotlib", "fitz", "pymupdf", "tkinter",
     # NOTE: do NOT exclude stdlib modules like unittest / pydoc, however

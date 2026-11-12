@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QLabel,
     QToolBar, QWidget, QProgressBar, QMessageBox,
     QFileDialog, QSizePolicy, QComboBox, QLineEdit,
-    QToolButton, QMenu,
+    QToolButton, QMenu, QStackedWidget,
 )
 
 from src.file_browser import FileBrowser
@@ -25,6 +25,7 @@ from src.update_ui import UpdateChecker
 from src import markup as mk
 from src import printing
 from src import recent
+from src import step as stepmod
 from src.appearance import AppearanceDialog
 
 
@@ -214,6 +215,40 @@ class _LoadWorker(QThread):
                 self.signals.error.emit(f"Unexpected error: {exc}")
 
 
+class _StepSignals(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+
+class _StepLoadWorker(QThread):
+    """Reads and tessellates a STEP model off the UI thread."""
+
+    def __init__(self, filepath: str):
+        super().__init__()
+        self.filepath = filepath
+        self.signals = _StepSignals()
+        self.cancel = threading.Event()
+
+    def run(self):
+        try:
+            model = stepmod.load(self.filepath, cancel=self.cancel)
+            if not self.cancel.is_set():
+                self.signals.finished.emit(model)
+        except stepmod.Cancelled:
+            pass
+        except stepmod.StepError as exc:
+            if not self.cancel.is_set():
+                self.signals.error.emit(str(exc))
+        except MemoryError:
+            if not self.cancel.is_set():
+                self.signals.error.emit(
+                    "Not enough memory to open this model. Close other "
+                    "programs and try again.")
+        except BaseException as exc:          # never let a thread die loud
+            if not self.cancel.is_set():
+                self.signals.error.emit(f"Unexpected error: {exc!r}")
+
+
 # ------------------------------------------------------------------ #
 #  Main window
 # ------------------------------------------------------------------ #
@@ -230,6 +265,12 @@ class MainWindow(QMainWindow):
         self._prefetch_worker: _PrefetchWorker | None = None
         self._raster_worker: _RasterWorker | None = None
         self._render_worker = None
+        self._step_worker: _StepLoadWorker | None = None
+        # The 3D view is built the first time a STEP file is opened: a
+        # QOpenGLWidget changes how Qt composites the whole window, and
+        # that should cost nothing for someone who only opens drawings.
+        self._model_view = None
+        self._model = None
 
         self._markup_store: mk.MarkupStore | None = None
         self._markup_warned_fallback = False
@@ -283,7 +324,11 @@ class MainWindow(QMainWindow):
         self._canvas.snapshotTaken.connect(self._on_snapshot_taken)
         self._canvas.statusMessage.connect(
             lambda msg: self.statusBar().showMessage(msg, 4000))
-        splitter.addWidget(self._canvas)
+        # Sheets on the canvas; STEP models in the 3D view, which joins
+        # this stack when it is first needed.
+        self._center = QStackedWidget()
+        self._center.addWidget(self._canvas)
+        splitter.addWidget(self._center)
 
         # Right: layer panel
         self._layers = LayerPanel()
@@ -310,7 +355,7 @@ class MainWindow(QMainWindow):
         # folders opened before. Recent lives here because the window has
         # no menu bar to hang an "Open Recent" submenu off.
         act_open = QAction("📂  Open Folder", self)
-        act_open.setToolTip("Open a folder of DWG files (Ctrl+O) — "
+        act_open.setToolTip("Open a folder of drawings and models (Ctrl+O) — "
                             "the arrow lists recent files and folders")
         act_open.setShortcut(QKeySequence("Ctrl+O"))
         act_open.triggered.connect(self._browse_folder)
@@ -365,6 +410,7 @@ class MainWindow(QMainWindow):
         act_find.setShortcut(QKeySequence("Ctrl+F"))
         act_find.triggered.connect(self._show_find)
         tb.addAction(act_find)
+        self._act_find = act_find
 
         tb.addSeparator()
 
@@ -372,7 +418,7 @@ class MainWindow(QMainWindow):
         act_fit = QAction("⛶  Fit View", self)
         act_fit.setToolTip("Fit drawing to window (F)")
         act_fit.setShortcut(QKeySequence("F"))
-        act_fit.triggered.connect(self._canvas.fit_to_view)
+        act_fit.triggered.connect(self._fit_view)
         tb.addAction(act_fit)
 
         tb.addSeparator()
@@ -507,6 +553,7 @@ class MainWindow(QMainWindow):
         act_render.setShortcut(QKeySequence("R"))
         act_render.triggered.connect(self._rerender)
         tb.addAction(act_render)
+        self._act_render = act_render
 
         # Push the update controls to the right-hand end of the toolbar.
         spacer = QWidget()
@@ -643,11 +690,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _print(self) -> None:
+        if self._model is not None:
+            return
         self._flush_markup()
         printing.print_drawing(self, self._canvas, self._current_conv,
                                self._markup_store)
 
     def _save_pdf(self) -> None:
+        if self._model is not None:
+            return
         self._flush_markup()
         printing.save_pdf(self, self._canvas, self._current_conv,
                           self._markup_store)
@@ -853,6 +904,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _set_snapshot_mode(self, on: bool) -> None:
+        if self._model is not None:
+            # No region to drag out of a 3D view: S copies what is shown.
+            if on:
+                self._act_snap.setChecked(False)
+                self._copy_view()
+            return
         self._canvas.set_snapshot_mode(on)
         if on:
             for act in self._markup_actions.values():
@@ -862,6 +919,11 @@ class MainWindow(QMainWindow):
                 "Drag a region to copy it to the clipboard — Esc cancels.", 5000)
 
     def _copy_view(self) -> None:
+        if self._model is not None:
+            img = self._model_view.copy_to_clipboard()
+            if img is not None:
+                self._on_snapshot_taken(img.width(), img.height())
+            return
         if not self._canvas.copy_view_to_clipboard():
             self.statusBar().showMessage("Nothing to copy — open a drawing first.",
                                          3000)
@@ -873,17 +935,24 @@ class MainWindow(QMainWindow):
             5000)
 
     def _save_view_image(self) -> None:
-        if self._current_conv is None:
+        if self._model is not None:
+            source = self._model.path
+        elif self._current_conv is not None:
+            source = self._current_conv.filepath
+        else:
             self.statusBar().showMessage("Open a drawing first.", 3000)
             return
-        default = f"{self._current_conv.filepath.stem}.png"
+        default = f"{source.stem}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Save image", default, "PNG image (*.png)")
         if not path:
             return
-        visible = self._canvas.mapToScene(
-            self._canvas.viewport().rect()).boundingRect()
-        image = self._canvas.render_region(visible)
+        if self._model is not None:
+            image = self._model_view.grab_image()
+        else:
+            visible = self._canvas.mapToScene(
+                self._canvas.viewport().rect()).boundingRect()
+            image = self._canvas.render_region(visible)
         if image is None or not image.save(path, "PNG"):
             self.statusBar().showMessage("Could not write that image.", 4000)
         else:
@@ -1120,15 +1189,22 @@ class MainWindow(QMainWindow):
         # Whatever the previous drawing still had running is asked to
         # stop; its results are ignored if they arrive anyway.
         for worker in (self._load_worker, self._raster_worker,
-                       self._geometry_worker, self._prefetch_worker):
+                       self._geometry_worker, self._prefetch_worker,
+                       self._step_worker):
             _retire(worker)
         self._prefetch_worker = None
         self._raster_worker = None
         self._geometry_worker = None
+        self._step_worker = None
 
         # Anything still pending for the previous drawing goes to disk
         # before its store is replaced.
         self._flush_markup()
+
+        if stepmod.is_step(filepath):
+            self._open_step(filepath)
+            return
+        self._set_3d_mode(False)
 
         self._current_conv = None
         self._canvas.set_markup_context(None, "0")
@@ -1155,6 +1231,124 @@ class MainWindow(QMainWindow):
         self._load_worker = worker
         _keep_alive(worker)
         worker.start()
+
+    # ------------------------------------------------------------------ #
+    #  STEP models
+    # ------------------------------------------------------------------ #
+
+    def _ensure_model_view(self):
+        if self._model_view is None:
+            from src.model_view import ModelView
+            mv = ModelView()
+            mv.pageNavigateRequested.connect(self._navigate_file)
+            mv.partSelected.connect(self._on_part_selected)
+            mv.statusMessage.connect(
+                lambda msg: self.statusBar().showMessage(msg, 6000))
+            self._center.addWidget(mv)
+            self._model_view = mv
+        return self._model_view
+
+    def _set_3d_mode(self, on: bool) -> None:
+        """Swap the centre between the sheet canvas and the 3D view, and
+        switch off everything that only makes sense on a sheet."""
+        if not on:
+            self._model = None
+            if self._model_view is not None:
+                self._model_view.clear()
+            self._center.setCurrentWidget(self._canvas)
+            self._layers.set_title("Layers")
+        else:
+            self._center.setCurrentWidget(self._ensure_model_view())
+            self._layers.set_title("Parts")
+        sheet_only = not on
+        for widget in (self._print_btn,):
+            widget.setEnabled(sheet_only)
+        for act in (self._act_pdf, self._act_find, self._act_pan,
+                    self._act_measure, self._act_nav, self._act_render,
+                    *self._markup_bar.actions()):
+            act.setEnabled(sheet_only)
+        if on:
+            self._hide_find()
+            self._measure_label.setText("")
+            self._coord_label.setText("")
+        else:
+            self._sync_markup_actions()
+            if not self._measure_label.text():
+                self._measure_label.setText("Measure: click two points")
+                self._coord_label.setText("X: \u2014    Y: \u2014")
+
+    def _open_step(self, filepath: str) -> None:
+        self._current_conv = None
+        self._canvas.set_markup_context(None, "0")
+        self._markup_store = None
+        self._canvas.clear()
+        self._layers.clear()
+        self._populate_sheets(None)
+        self._set_3d_mode(True)
+        self._model_view.clear()
+        self._pending_sheet = None
+        if not stepmod.kernel_available():
+            self._on_load_error(
+                "STEP support is not installed in this copy of the viewer "
+                "(the OpenCascade kernel is missing). Reinstall the viewer "
+                "to open STEP files.")
+            return
+        name = Path(filepath).name
+        cached = stepmod.has_cached_mesh(filepath)
+        self._file_label.setText(
+            f"Loading: {name} …" if cached else
+            f"Reading {name} — first open only, a big assembly can take a "
+            f"minute. Later opens are instant.")
+        self._progress.setVisible(True)
+
+        worker = _StepLoadWorker(filepath)
+        worker.signals.finished.connect(
+            lambda model, w=worker: self._on_step_loaded(model)
+            if w is self._step_worker and not w.cancel.is_set() else None)
+        worker.signals.error.connect(
+            lambda msg, w=worker: self._on_load_error(msg)
+            if w is self._step_worker and not w.cancel.is_set() else None)
+        worker.finished.connect(
+            lambda w=worker: self._progress.setVisible(False)
+            if w is self._step_worker else None)
+        worker.finished.connect(worker.deleteLater)
+        self._step_worker = worker
+        _keep_alive(worker)
+        worker.start()
+
+    def _on_step_loaded(self, model) -> None:
+        self._model = model
+        self._model_view.set_model(model)
+        self._model_view.setFocus()
+        n = len(model.parts)
+        self._layers.populate(model.layers(),
+                              None if n else "This model has no parts.")
+        self._file_label.setText(
+            f"{model.path.name}  ({n} part{'s' if n != 1 else ''}, "
+            f"{model.size_text()})")
+        self._progress.setVisible(False)
+        self.statusBar().showMessage(
+            f"{model.triangle_count:,} triangles. Drag to rotate, middle-drag "
+            f"or Shift+drag to pan, wheel to zoom, click a part to select it.",
+            8000)
+
+    def _on_part_selected(self, label: str) -> None:
+        if not label or self._model is None:
+            self.statusBar().clearMessage()
+            return
+        part = self._model.part(label)
+        if part is None:
+            return
+        n = part.instances
+        self.statusBar().showMessage(
+            f"{part.name}" + (f" — {n} instances" if n > 1 else "") +
+            "   (Esc clears the selection)")
+
+    def _fit_view(self) -> None:
+        if self._model is not None:
+            self._model_view.fit()
+        else:
+            self._canvas.fit_to_view()
 
     @staticmethod
     def _loading_message(filepath: str) -> str:
@@ -1381,8 +1575,8 @@ class MainWindow(QMainWindow):
         self._file_label.setText("Error loading file")
         QMessageBox.critical(
             self, "Cannot open file",
-            f"{message}\n\nSupported files are DWG and DXF (R2000–R2018) "
-            f"and DWFx."
+            f"{message}\n\nSupported files are DWG and DXF (R2000–R2018), "
+            f"DWF, DWFx and STEP (.step, .stp)."
         )
 
     def _start_render(self):
@@ -1497,6 +1691,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._flush_markup()
         self.hide()             # the wait below should not look like a hang
+        if self._step_worker is not None:
+            self._step_worker.cancel.set()
         _stop_all_workers()
         super().closeEvent(event)
 
@@ -1505,12 +1701,19 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _on_layer_toggled(self, name: str, visible: bool):
+        if self._model is not None:
+            # Parts show and hide at once: no re-decode to wait for.
+            self._model_view.set_part_visible(name, visible)
+            return
         if self._current_conv:
             self._current_conv.set_layer_visible(name, visible)
         # Don't auto-rerender on every click — user presses "Apply Layers" (R)
         # This keeps it snappy when toggling many layers at once.
 
     def _on_all_layers_toggled(self, visible: bool):
+        if self._model is not None:
+            self._model_view.set_all_visible(visible)
+            return
         if self._current_conv:
             self._current_conv.set_all_layers_visible(visible)
 

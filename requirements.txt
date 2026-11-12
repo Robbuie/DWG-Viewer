@@ -11,3 +11,12 @@ Pillow>=10.0.0
 # segments per viewport redraw. It arrives with ezdxf anyway; pinned
 # here because this app now depends on it in its own right.
 numpy>=1.24
+
+# STEP (.step / .stp) models. OpenCascade through its Python bindings;
+# the -novtk build, because the plain cadquery-ocp wheel links against
+# VTK (~300 MB) which this app never uses. Adds ~150 MB installed.
+cadquery-ocp-novtk>=7.9.3.1,<7.10  # 8.x (OCCT 8) not yet tested here
+# OpenGL calls for the 3D view (QOpenGLWidget gives the context, PyQt6
+# does not expose fixed-function GL). Without it the view falls back to
+# a slower software renderer rather than failing.
+PyOpenGL>=3.1.7

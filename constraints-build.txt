@@ -17,3 +17,6 @@ pyparsing==3.3.2
 typing_extensions==4.15.0
 pyinstaller==6.19.0
 pyinstaller-hooks-contrib==2026.3
+cadquery-ocp-novtk==7.9.3.1.1
+cadquery-ocp-proxy==7.9.3.1.1
+PyOpenGL==3.1.10

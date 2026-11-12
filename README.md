@@ -3,7 +3,7 @@
 A fast drawing viewer for Windows: folder thumbnails, pan/zoom, layer
 toggles, point-to-point measurement, redline markup, text search,
 printing to scale, PDF export of whole drawing sets, and snapshots to
-the clipboard.
+the clipboard — plus a shaded 3D view for STEP models.
 
 ## Supported formats
 
@@ -13,6 +13,7 @@ the clipboard.
 | `.dwg` | ODA File Converter → DXF → ezdxf | ODA File Converter |
 | `.dwfx` | XPS markup translated to SVG in-process | — |
 | `.dwf` | WHIP!/W2D opcodes decoded in-process | — |
+| `.step` / `.stp` | OpenCascade, tessellated in-process | — (bundled) |
 
 Nothing here needs a converter except DWG.
 
@@ -35,6 +36,47 @@ formats use, so a classic DWF is handled differently:
   resolution instead of magnifying pixels
 * the folder grid shows the plot preview AutoCAD embeds when publishing,
   so tiles appear immediately without decoding anything
+
+## STEP models
+
+A STEP file is a 3D solid model rather than a sheet, so it opens in a
+shaded 3D view in place of the drawing canvas. Reading one needs a real
+geometry kernel; the viewer bundles OpenCascade through the
+`cadquery-ocp-novtk` wheel (about 150 MB installed — the plain
+`cadquery-ocp` wheel would add another ~300 MB of VTK that is never
+used). `src/step.py` is the only module that touches it, and hands
+back plain numpy triangle meshes.
+
+* **Moving around** — left-drag rotates (turntable: it never rolls the
+  model onto its side), middle-drag or `Shift`/`Alt`+drag pans, the
+  wheel zooms about the cursor, double-click or `F` fits.
+* **Standard views** — Iso, Front, Back, Top, Bottom, Left and Right on
+  the strip above the model (`0` iso, then `1`–`6` for front, back,
+  right, left, top, bottom). CAD packages disagree about which axis is up — Creo,
+  NX and CATIA are Z-up, SolidWorks, Inventor and Fusion Y-up — so the
+  **Z up / Y up** button picks, and the choice is remembered.
+* **Parts** — the side panel lists the assembly's parts in place of
+  layers, with their colours. Repeated parts are one row (`M8 bolt ×40`),
+  and unticking hides them at once — there is nothing to re-render.
+  Click a part in the view to highlight it and see its name; `Esc`
+  clears it. `E` toggles the edge lines.
+* **Snapshots** — `S` or `Ctrl`+`Shift`+`C` copies the view,
+  `Ctrl`+`Shift`+`S` saves it as a PNG. Printing, PDF export, measuring,
+  markup and text search are sheet tools and are switched off while a
+  model is open.
+* **Speed** — the first open tessellates the model (roughly 10 s per
+  million triangles) and caches the mesh under
+  `%LOCALAPPDATA%\DWGViewer\cache\mesh`, capped at 2 GB; every later
+  open is a file read. Folder thumbnails come from the same pass.
+* **Graphics** — the view uses OpenGL 1.x-level calls, so it runs on
+  anything down to Windows' own software GL over Remote Desktop. If no
+  OpenGL context can be had at all it falls back to a software renderer
+  and says so in the status bar; set `DWGV_SOFTWARE_3D=1` to force that.
+  The OpenGL widget is not created until the first STEP file is
+  opened, so nothing changes for anyone who only opens drawings.
+
+Units are whatever OpenCascade converts the file to — millimetres — and
+the status bar shows the model's overall size.
 
 ## Sheets
 
@@ -100,6 +142,8 @@ python tests\test_markup.py
 python tests\test_printing.py
 python tests\test_w2d_layers.py
 python tests\test_converter_dwf.py
+python tests\test_model_camera.py
+python tests\test_step.py
 ```
 
 Or `pytest tests`, which every file also works as. CI runs the suite on
@@ -128,6 +172,15 @@ DWF 6 container around one of those streams and drives the converter
 through decoding, hiding a layer, and a second open that reads the cache
 instead of decoding again.
 
+`test_model_camera.py` covers the 3D view's camera maths with numpy
+alone. `test_step.py` builds its STEP models with OpenCascade itself
+(`tests/step_fixtures.py` — run it directly to write a sample assembly to
+try the viewer with) and checks names, instancing, colours (per part and
+per face), the mesh cache, the software renderer's depth handling, part
+picking and the main window's switch into and out of 3D. It skips if
+OpenCascade is not installed. On the offscreen platform it exercises the
+software renderer; the OpenGL path was checked under Xvfb with Mesa.
+
 ## Diagnostics
 
 `tools/dwf_inspect.py` dumps a DWF's container: version, sections,
@@ -141,7 +194,7 @@ arguments.
 
 | Key | Action |
 |-----|--------|
-| `F` | Fit drawing to window |
+| `F` | Fit drawing to window (or the model to the 3D view) |
 | `M` | Measure mode |
 | `P` | Pan mode |
 | `R` | Re-render after toggling layers |
@@ -164,6 +217,9 @@ arguments.
 | `Ctrl`+`\` | Show / hide both side panels |
 | `Ctrl`+`3` | Show / hide the markup toolbar |
 | `←` `→` | Previous / next file |
+| `0` – `6` | 3D: Iso, Front, Back, Right, Left, Top, Bottom view |
+| `E` | 3D: Show / hide edges |
+| `Esc` | 3D: Clear the part selection |
 
 Middle-drag (or Alt+left-drag) pans; the scroll wheel zooms.
 

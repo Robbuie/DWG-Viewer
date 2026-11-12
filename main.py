@@ -129,8 +129,8 @@ def main() -> None:
         folder = Path(sys.argv[1])
         if folder.is_dir():
             window._browser.open_folder(folder)
-        elif folder.is_file() and folder.suffix.lower() in {".dwg", ".dxf",
-                                                           ".dwf", ".dwfx"}:
+        elif folder.is_file() and folder.suffix.lower() in {
+                ".dwg", ".dxf", ".dwf", ".dwfx", ".step", ".stp"}:
             window._browser.open_folder(folder.parent)
             window._open_file(str(folder))
 

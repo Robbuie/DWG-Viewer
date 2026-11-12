@@ -60,6 +60,7 @@ RENDERER_GENERATION = 4
 MAX_THUMB_FILES = 20_000
 MAX_DXF_BYTES   = 4 * 1024 ** 3      # 4 GB of converted DXFs
 MAX_RASTER_BYTES = 2 * 1024 ** 3     # 2 GB of decoded DWF sheets
+MAX_MESH_BYTES  = 2 * 1024 ** 3     # 2 GB of tessellated STEP models
 
 _dirs_ready = False
 _dirs_lock  = threading.Lock()
@@ -366,6 +367,27 @@ def prune() -> None:
                     p.unlink()
                 except OSError:
                     pass
+    except OSError:
+        pass
+
+    try:
+        # Tessellated STEP models (src/step.py). Looked up from CACHE_ROOT
+        # at call time, like step.py does, rather than a module constant.
+        mesh_dir = CACHE_ROOT / "mesh"
+        if mesh_dir.is_dir():
+            meshes = [(p.stat().st_mtime, p.stat().st_size, p)
+                      for p in mesh_dir.iterdir() if p.is_file()]
+            total = sum(s for _, s, _ in meshes)
+            if total > MAX_MESH_BYTES:
+                meshes.sort()
+                for _, size, p in meshes:
+                    if total <= MAX_MESH_BYTES:
+                        break
+                    try:
+                        p.unlink()
+                        total -= size
+                    except OSError:
+                        pass
     except OSError:
         pass
 

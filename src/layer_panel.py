@@ -81,6 +81,7 @@ class LayerPanel(QWidget):
         header = QLabel("Layers")
         header.setObjectName("panelTitle")
         outer.addWidget(header)
+        self._header = header
 
         # Show all / Hide all buttons
         btn_row = QHBoxLayout()
@@ -184,6 +185,14 @@ class LayerPanel(QWidget):
 
     def clear(self) -> None:
         self.populate([])
+
+    def set_title(self, text: str) -> None:
+        """"Layers" for drawings, "Parts" for a STEP model's assembly."""
+        self._header.setText(text)
+
+    @property
+    def title(self) -> str:
+        return self._header.text()
 
     @property
     def note(self) -> str:

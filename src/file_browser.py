@@ -51,7 +51,7 @@ from src import recent
 
 _THUMB_W, _THUMB_H = 160, 110
 _RENDER_SCALE      = 2               # cache at 2x for crisp hi-DPI display
-_SUPPORTED         = {".dwg", ".dxf", ".dwf", ".dwfx"}
+_SUPPORTED         = {".dwg", ".dxf", ".dwf", ".dwfx", ".step", ".stp"}
 
 # How far beyond the visible area to pre-load, as a multiple of one
 # viewport height. 1.0 means "one screen above and one below", which is
@@ -543,6 +543,51 @@ class _DwfThumbWorker(QRunnable):
         if not img.loadFromData(QByteArray(data), "PNG") or img.isNull():
             return None
         return img
+
+
+# ── Worker 4b: STEP model thumbnail ──────────────────────────────────
+
+class _StepThumbWorker(QRunnable):
+    """A shaded isometric of a STEP model, painted in software.
+
+    Reading the model also fills the mesh cache, so the first open of a
+    file whose tile has already been drawn is a cache read too.
+    """
+
+    def __init__(self, gen: int, filepath: str, signals: _Signals, is_current):
+        super().__init__()
+        self.gen, self.filepath, self.signals = gen, filepath, signals
+        self._is_current = is_current
+        self.setAutoDelete(True)
+
+    def run(self):
+        if not self._is_current(self.gen):
+            return
+        try:
+            from src import step
+            if not step.kernel_available():
+                return
+            model = step.load(self.filepath)
+            from PyQt6.QtCore import QSettings
+            up = str(QSettings().value("model/upAxis", "z"))
+            img = step.render_thumbnail(model, _THUMB_W * _RENDER_SCALE,
+                                        _THUMB_H * _RENDER_SCALE,
+                                        background="#ffffff",
+                                        up=up)
+            if img is None or img.isNull():
+                return
+            if _cache:
+                try:
+                    _cache.store_png(Path(self.filepath), _image_to_png_bytes(img))
+                except Exception:
+                    pass
+            self.signals.done.emit(self.gen, self.filepath, img, _RANK_FINAL)
+        except Exception:
+            if _cache:
+                try:
+                    _cache.mark_failure(Path(self.filepath))
+                except Exception:
+                    pass
 
 
 # ── Worker 5: one sheet of a drawing set ─────────────────────────────
@@ -1066,6 +1111,14 @@ class FileBrowser(QWidget):
                 return False
             self._render_pool.start(
                 _DwfThumbWorker(gen, fp, self._signals, self._is_current))
+            return False
+
+        # 3c. STEP is tessellated by OpenCascade and painted in software.
+        if suffix in (".step", ".stp"):
+            if _cache is not None and _cache.is_known_failure(path):
+                return False
+            self._render_pool.start(
+                _StepThumbWorker(gen, fp, self._signals, self._is_current))
             return False
 
         # 4. DWG needs ODA, unless we already know it cannot be converted.

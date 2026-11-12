@@ -61,7 +61,15 @@ back plain numpy triangle meshes.
   Click a part in the view to highlight it and see its name; `Esc`
   clears it. `E` toggles the edge lines.
 * **Snapshots** — `S` or `Ctrl`+`Shift`+`C` copies the view,
-  `Ctrl`+`Shift`+`S` saves it as a PNG. Printing, PDF export, measuring,
+  `Ctrl`+`Shift`+`S` saves it as PNG or JPG; the **Snapshot** button on
+  the view's strip does both. Snapshots are re-rendered at twice screen
+  resolution without the selection highlight. By default everything not
+  covered by the model is transparent — in a PNG, and on the clipboard
+  (a PNG copy goes on alongside the bitmap, which is what Office and
+  image editors paste) — and the XYZ indicator is left out. Both are
+  switches under **Snapshot** or **View ▸ 3D Model**, and are
+  remembered. JPEG cannot hold transparency, so a JPG is flattened onto
+  white. Printing, PDF export, measuring,
   markup and text search are sheet tools and are switched off while a
   model is open.
 * **Speed** — the first open tessellates the model (roughly 10 s per
@@ -144,6 +152,7 @@ python tests\test_w2d_layers.py
 python tests\test_converter_dwf.py
 python tests\test_model_camera.py
 python tests\test_step.py
+python tests\test_menus_and_updates.py
 ```
 
 Or `pytest tests`, which every file also works as. CI runs the suite on
@@ -190,6 +199,17 @@ understand, printing the offset and a hexdump — which is how the decoder
 was built. Drop files in `samples/` (gitignored) and run either with no
 arguments.
 
+## Menus
+
+**File**, **Edit**, **View**, **Tools** and **Help** across the top hold
+every command, with its key beside it, so nothing is only reachable by
+knowing the shortcut. They are the same commands as the toolbar buttons
+(one action each, so one shortcut and one enabled state): sheet-only
+commands grey out in both places while a STEP model is open, and
+**View ▸ 3D Model** is live only then. **Help ▸ Keyboard Shortcuts**
+(`F1`) lists every key, read off the menus themselves. Check for
+Updates, Appearance and About moved off the toolbar into Help and View.
+
 ## Keys
 
 | Key | Action |
@@ -199,6 +219,8 @@ arguments.
 | `P` | Pan mode |
 | `R` | Re-render after toggling layers |
 | `N` | Show / hide the navigator |
+| `F1` | Keyboard shortcuts |
+| `Ctrl`+`Q` | Exit |
 | `Ctrl`+`O` | Open a folder of drawings |
 | `Ctrl`+`P` | Print — to scale or fitted |
 | `Ctrl`+`Shift`+`P` | Save as PDF — this sheet or the whole set |
@@ -206,7 +228,7 @@ arguments.
 | `F3` | Find the next match |
 | `S` | Snapshot — drag a region to the clipboard |
 | `Ctrl`+`Shift`+`C` | Copy the whole visible drawing |
-| `Ctrl`+`Shift`+`S` | Save the visible drawing as a PNG |
+| `Ctrl`+`Shift`+`S` | Save the visible drawing (or model) as PNG or JPG |
 | `V` | Select markup |
 | `C` `B` `E` `A` `D` `T` | Cloud, box, ellipse, arrow, pen, note |
 | `H` | Show / hide all markup |
@@ -330,7 +352,7 @@ sees it.
 
 `S`, then drag a region: it lands on the clipboard ready to paste into
 an email or a report. `Ctrl`+`Shift`+`C` copies the whole visible
-drawing and `Ctrl`+`Shift`+`S` writes it to a PNG.
+drawing and `Ctrl`+`Shift`+`S` writes it to a PNG or JPG.
 
 Snapshots are re-rendered from the drawing at roughly twice screen
 resolution on a white background, with any markup included — a snapshot

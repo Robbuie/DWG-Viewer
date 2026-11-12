@@ -2,8 +2,8 @@
 update_ui.py — Qt glue for the GitHub updater.
 
 Two entry points:
-  • check_silently(parent)  — run at startup, at most once a day, and
-    say nothing unless an update actually exists
+  • check_silently(parent)  — run at startup and every few hours while
+    the app stays open; says nothing unless an update actually exists
   • check_interactively(parent) — the Help ▸ Check for Updates action,
     which always reports its result
 
@@ -22,17 +22,27 @@ from PyQt6.QtWidgets import QMessageBox, QProgressDialog, QApplication
 from src import updater
 from src.version import __version__, APP_NAME
 
-_CHECK_INTERVAL = 24 * 3600      # once a day for the silent check
+# The silent check runs at every launch unless one *succeeded* within
+# this window. It used to be once a day, stamped before the check ran:
+# open the viewer in the morning, publish a release at lunch, and nobody
+# heard about it until the next day — and a check that failed (VPN down,
+# proxy) still counted as done.
+_CHECK_INTERVAL = 2 * 3600
+# While the app stays open — people leave it running for days.
+RECHECK_MS = 6 * 3600 * 1000
+
+_KEY_LAST = "updates/last_check"
+_KEY_SKIP = "updates/skipped_version"
 
 
 class _CheckWorker(QThread):
-    finished_check = pyqtSignal(object)      # dict | None
+    finished_check = pyqtSignal(str, object)      # outcome, dict | None
 
     def run(self):
         try:
-            self.finished_check.emit(updater.check_for_update())
+            self.finished_check.emit(*updater.check())
         except Exception:
-            self.finished_check.emit(None)
+            self.finished_check.emit(updater.FAILED, None)
 
 
 class _DownloadWorker(QThread):
@@ -55,6 +65,10 @@ class _DownloadWorker(QThread):
             self.failed.emit(str(exc))
 
 
+def _settings() -> QSettings:
+    return QSettings("DWGViewer", "DWGViewer")
+
+
 class UpdateChecker(QObject):
     """Owns the worker threads so they are not garbage-collected mid-run."""
 
@@ -69,11 +83,9 @@ class UpdateChecker(QObject):
     # ── Entry points ─────────────────────────────────────────────────
 
     def check_silently(self) -> None:
-        settings = QSettings("DWGViewer", "DWGViewer")
-        last = float(settings.value("updates/last_check", 0) or 0)
+        last = float(_settings().value(_KEY_LAST, 0) or 0)
         if time.time() - last < _CHECK_INTERVAL:
             return
-        settings.setValue("updates/last_check", time.time())
         self._start(interactive=False)
 
     def check_interactively(self) -> None:
@@ -89,12 +101,28 @@ class UpdateChecker(QObject):
         self._check.finished_check.connect(self._on_check_done)
         self._check.start()
 
-    def _on_check_done(self, info) -> None:
-        if info is None:
+    def _on_check_done(self, outcome: str, info) -> None:
+        settings = _settings()
+        if outcome != updater.FAILED:
+            # Only a check that got an answer counts as done.
+            settings.setValue(_KEY_LAST, time.time())
+        if outcome == updater.FAILED:
+            if self._interactive:
+                QMessageBox.warning(
+                    self._parent, "Could not check for updates",
+                    "GitHub could not be reached to check for a newer "
+                    f"version. You are running {APP_NAME} {__version__}.\n\n"
+                    "Check the network or VPN and try again.")
+            return
+        if outcome == updater.LATEST:
             if self._interactive:
                 QMessageBox.information(
                     self._parent, "No updates",
                     f"{APP_NAME} {__version__} is the latest version.")
+            return
+        # "Skip this version" only quiets the automatic check; asking
+        # from the Help menu always offers it.
+        if not self._interactive and settings.value(_KEY_SKIP, "") == info["version"]:
             return
 
         notes = (info.get("notes") or "").strip()
@@ -109,10 +137,16 @@ class UpdateChecker(QObject):
         if notes:
             box.setDetailedText(notes)
         install = box.addButton("Install now", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        skip = box.addButton("Skip this version", QMessageBox.ButtonRole.DestructiveRole)
+        later = box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(install)
+        box.setEscapeButton(later)
         box.exec()
         if box.clickedButton() is install:
+            settings.remove(_KEY_SKIP)
             self._download(info)
+        elif box.clickedButton() is skip:
+            settings.setValue(_KEY_SKIP, info["version"])
 
     # ── Download + install ───────────────────────────────────────────
 

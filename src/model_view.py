@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QToolBar, QStackedLayout,
 
 from src.model_camera import Camera, PRESETS
 from src import theme
+from src import snapshot_prefs
 
 _EDGE_RGB = (0.10, 0.11, 0.13)
 _SELECT_RGB = np.array([1.0, 0.55, 0.10], np.float32)
@@ -42,6 +43,29 @@ _HALF_VEC = _HALF_VEC / np.linalg.norm(_HALF_VEC)
 
 _SETTINGS_UP = "model/upAxis"
 _SETTINGS_EDGES = "model/edges"
+
+
+def set_clipboard_image(img: QImage) -> None:
+    """Put an image with an alpha channel on the clipboard so that it
+    stays transparent when pasted.
+
+    The bitmap formats Windows apps have always read (CF_DIB) have no
+    alpha, so a transparent image pasted from them lands on black. Office,
+    browsers and most image editors look for a "PNG" clipboard format
+    first and keep the transparency; Qt registers "image/png" under that
+    name on Windows. The plain image goes on as well for everything else.
+    """
+    from PyQt6.QtCore import QMimeData, QByteArray, QBuffer, QIODevice
+    data = QByteArray()
+    buf = QBuffer(data)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    buf.close()
+    mime = QMimeData()
+    mime.setImageData(img)
+    mime.setData("image/png", data)
+    mime.setData("PNG", data)
+    QGuiApplication.clipboard().setMimeData(mime)
 
 
 # ── Software renderer (thumbnails and the no-GL fallback) ────────────
@@ -228,11 +252,14 @@ def render_thumbnail(model, width: int, height: int, background: str = "#ffffff"
 
 
 def _axis_triad(painter: QPainter, camera: Camera, x0: float, y0: float,
-                length: float = 26) -> None:
-    """Little XYZ gizmo in the corner, so a rotated part keeps its bearings."""
+                length: float = 26, scale: float = 1.0) -> None:
+    """Little XYZ gizmo in the corner, so a rotated part keeps its bearings.
+    ``scale`` sizes it for a snapshot rendered above screen resolution."""
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    x0, y0, length = x0 * scale, y0 * scale, length * scale
     font = QFont()
-    font.setPointSize(8)
+    font.setPixelSize(max(1, round(11 * scale)))
     font.setBold(True)
     painter.setFont(font)
     axes = (("X", (1, 0, 0), QColor(220, 70, 60)),
@@ -244,9 +271,10 @@ def _axis_triad(painter: QPainter, camera: Camera, x0: float, y0: float,
         items.append((v[2], name, v, col))
     for _, name, v, col in sorted(items, key=lambda t: t[0]):
         end = QPointF(x0 + v[0] * length, y0 - v[1] * length)
-        painter.setPen(QPen(col, 2))
+        painter.setPen(QPen(col, 2 * scale))
         painter.drawLine(QPointF(x0, y0), end)
-        painter.drawText(QPointF(end.x() + 3 * v[0] - 3, end.y() - 3 * v[1] + 4), name)
+        painter.drawText(QPointF(end.x() + (3 * v[0] - 3) * scale,
+                                 end.y() + (-3 * v[1] + 4) * scale), name)
 
 
 def _theme_background() -> tuple[QColor, QColor]:
@@ -465,9 +493,9 @@ if QOpenGLWidget is not None:
                 fn(*args, buf)
 
         # ── drawing ──────────────────────────────────────────────────
-        def _matrices(self):
+        def _matrices(self, cam=None):
             GL = self.GL
-            cam = self.camera
+            cam = cam or self.camera
             near, far = cam.depth_range()
             GL.glMatrixMode(GL.GL_PROJECTION)
             GL.glLoadIdentity()
@@ -482,7 +510,7 @@ if QOpenGLWidget is not None:
             GL.glLightfv(GL.GL_LIGHT1, GL.GL_POSITION, (0.4, -0.6, 0.5, 0.0))
             GL.glLoadMatrixd(cam.modelview().T.flatten())
 
-        def _draw_parts(self, pick=False):
+        def _draw_parts(self, pick=False, highlight=True):
             GL = self.GL
             model = self.owner.model
             GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
@@ -497,7 +525,7 @@ if QOpenGLWidget is not None:
                 else:
                     GL.glEnableClientState(GL.GL_NORMAL_ARRAY)
                     self._pointer(GL.glNormalPointer, n, GL.GL_FLOAT, 0)
-                    if part.label == self.owner.selected:
+                    if highlight and part.label == self.owner.selected:
                         GL.glColor3f(*_SELECT_RGB)
                     elif c is not None:
                         GL.glEnableClientState(GL.GL_COLOR_ARRAY)
@@ -562,11 +590,13 @@ if QOpenGLWidget is not None:
                 _axis_triad(painter, self.camera, 40, self.height() - 40)
             painter.end()
 
-        def _restore_state(self):
+        def _restore_state(self, size=None):
             """QPainter leaves GL state of its own behind; put back ours."""
             GL = self.GL
-            dpr = self.devicePixelRatioF()
-            GL.glViewport(0, 0, int(self.width() * dpr), int(self.height() * dpr))
+            if size is None:
+                dpr = self.devicePixelRatioF()
+                size = (int(self.width() * dpr), int(self.height() * dpr))
+            GL.glViewport(0, 0, *size)
             GL.glEnable(GL.GL_DEPTH_TEST)
             GL.glDepthMask(GL.GL_TRUE)
             GL.glDisable(GL.GL_BLEND)
@@ -615,6 +645,56 @@ if QOpenGLWidget is not None:
 
         def grab_image(self) -> QImage:
             return self.grabFramebuffer()
+
+        def render_offscreen(self, cam: Camera, width: int, height: int):
+            """The model alone on a transparent background, at any size.
+
+            Drawn into a multisampled framebuffer object rather than
+            grabbed off the screen, so there is no backdrop to remove,
+            edges are antialiased, and the size is not tied to the window.
+            Returns None if this driver has no FBOs (GL 1.x); the caller
+            falls back to the software renderer.
+            """
+            if not self._ok or self.owner.model is None:
+                return None
+            from PyQt6.QtOpenGL import (QOpenGLFramebufferObject,
+                                        QOpenGLFramebufferObjectFormat)
+            GL = self.GL
+            self.makeCurrent()
+            fbo = None
+            try:
+                if not QOpenGLFramebufferObject.hasOpenGLFramebufferObjects():
+                    return None
+                fmt = QOpenGLFramebufferObjectFormat()
+                fmt.setAttachment(
+                    QOpenGLFramebufferObject.Attachment.CombinedDepthStencil)
+                fmt.setSamples(4)
+                fbo = QOpenGLFramebufferObject(width, height, fmt)
+                if not fbo.isValid():
+                    return None
+                fbo.bind()
+                self._restore_state((width, height))
+                GL.glClearColor(0, 0, 0, 0)
+                GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+                self._matrices(cam)
+                self._draw_parts(highlight=False)
+                if self.owner.show_edges:
+                    self._draw_edges()
+                GL.glFinish()
+                img = fbo.toImage()
+                fbo.release()
+                return None if img.isNull() else img.convertToFormat(
+                    QImage.Format.Format_ARGB32_Premultiplied)
+            except Exception:
+                return None
+            finally:
+                fbo = None                     # freed while still current
+                try:
+                    GL.glBindFramebuffer(GL.GL_FRAMEBUFFER,
+                                         self.defaultFramebufferObject())
+                except Exception:
+                    pass
+                self.doneCurrent()
 else:                                  # pragma: no cover
     _GLView = None
 
@@ -727,6 +807,8 @@ class ModelView(QWidget):
     pageNavigateRequested = pyqtSignal(int)
     partSelected = pyqtSignal(str)          # label, or "" for none
     statusMessage = pyqtSignal(str)
+    snapshotTaken = pyqtSignal(int, int)    # width, height
+    saveImageRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -843,7 +925,40 @@ class ModelView(QWidget):
         self._up_btn = up_btn
         self._sync_up_label()
         tb.addWidget(up_btn)
+
+        tb.addSeparator()
+        snap_btn = QToolButton()
+        snap_btn.setText("Snapshot")
+        snap_btn.setToolTip("Copy or save the view — and choose what goes in it")
+        snap_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        smenu = QMenu(snap_btn)
+        a = smenu.addAction("Copy to Clipboard")
+        a.triggered.connect(self._snapshot_copy)
+        a = smenu.addAction("Save Image (PNG or JPG)…")
+        a.triggered.connect(self.saveImageRequested.emit)
+        smenu.addSeparator()
+        self._act_snap_clear = smenu.addAction("Transparent Background")
+        self._act_snap_clear.setCheckable(True)
+        self._act_snap_clear.toggled.connect(self.set_snapshot_transparent)
+        self._act_snap_triad = smenu.addAction("Include XYZ Indicator")
+        self._act_snap_triad.setCheckable(True)
+        self._act_snap_triad.toggled.connect(self.set_snapshot_triad)
+
+        def sync():
+            for act, on in ((self._act_snap_clear, self.snapshot_transparent()),
+                            (self._act_snap_triad, self.snapshot_triad())):
+                act.blockSignals(True)
+                act.setChecked(on)
+                act.blockSignals(False)
+        smenu.aboutToShow.connect(sync)
+        snap_btn.setMenu(smenu)
+        tb.addWidget(snap_btn)
         return tb
+
+    def _snapshot_copy(self):
+        img = self.copy_to_clipboard()
+        if img is not None:
+            self.snapshotTaken.emit(img.width(), img.height())
 
     def _sync_up_label(self):
         self._up_btn.setText(f"{self.camera.up.upper()} up")
@@ -913,15 +1028,68 @@ class ModelView(QWidget):
         self._refresh()
 
     def grab_image(self) -> QImage | None:
+        """What is on screen, backdrop and all."""
         if self.model is None:
             return None
         return self._view.grab_image()
 
+    # ── snapshots ────────────────────────────────────────────────────
+    snapshot_transparent = staticmethod(snapshot_prefs.transparent)
+    snapshot_triad = staticmethod(snapshot_prefs.triad)
+    set_snapshot_transparent = staticmethod(snapshot_prefs.set_transparent)
+    set_snapshot_triad = staticmethod(snapshot_prefs.set_triad)
+
+    def snapshot(self, scale: float = 2.0, transparent: bool | None = None,
+                 triad: bool | None = None) -> QImage | None:
+        """The view re-rendered for export.
+
+        At ``scale`` times the window's size, like the sheet snapshots —
+        a picture pasted into a report should not look like a photograph
+        of a monitor. Everything not covered by the model is transparent
+        unless the backdrop is asked for; the XYZ indicator is included
+        only if asked for. The selection highlight is never included:
+        it is a state of the screen, not of the model.
+        """
+        if self.model is None:
+            return None
+        transparent = self.snapshot_transparent() if transparent is None else transparent
+        triad = self.snapshot_triad() if triad is None else triad
+        lw, lh = max(1, self._view.width()), max(1, self._view.height())
+        w, h = max(1, round(lw * scale)), max(1, round(lh * scale))
+        cam = self.camera.copy()
+        cam.resize(lw, lh)                 # framing from the window...
+        big = cam.copy()
+        big.resize(w, h)                   # ...same aspect, more pixels
+        img = None
+        if _GLView is not None and isinstance(self._view, _GLView):
+            img = self._view.render_offscreen(big, w, h)
+        if img is None:
+            img = render_image(self.model, big, w, h, background=None,
+                               max_triangles=2_000_000,
+                               edges=self.show_edges, selected=None)
+        if not transparent:
+            out = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+            p = QPainter(out)
+            top, bottom = _theme_background()
+            from PyQt6.QtGui import QLinearGradient
+            grad = QLinearGradient(0, 0, 0, h)
+            grad.setColorAt(0, top)
+            grad.setColorAt(1, bottom)
+            p.fillRect(out.rect(), grad)
+            p.drawImage(0, 0, img)
+            p.end()
+            img = out
+        if triad:
+            p = QPainter(img)
+            _axis_triad(p, cam, 40, lh - 40, scale=scale)
+            p.end()
+        return img
+
     def copy_to_clipboard(self) -> QImage | None:
-        img = self.grab_image()
+        img = self.snapshot()
         if img is None or img.isNull():
             return None
-        QGuiApplication.clipboard().setImage(img)
+        set_clipboard_image(img)
         return img
 
     def _refresh(self):

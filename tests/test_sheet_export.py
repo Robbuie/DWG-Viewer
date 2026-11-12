@@ -516,5 +516,8 @@ def test_the_window_offers_save_as_pdf():
     w = MainWindow()
     assert w._act_pdf.shortcut().toString() == "Ctrl+Shift+P"
     menu = w._print_btn.menu()
-    assert [a.text() for a in menu.actions()] == ["🖨  Print", "Save as PDF…"]
+    # The same actions as File ▸ Print / Save as PDF, so the same labels.
+    assert [a.text().replace("&", "") for a in menu.actions()] == \
+        ["Print…", "Save as PDF…"]
+    assert w._print_btn.text() == "🖨  Print"
     w.close()

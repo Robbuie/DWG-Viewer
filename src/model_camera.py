@@ -96,6 +96,15 @@ class Camera:
         self._lo = np.full(3, -1.0)
         self._hi = np.full(3, 1.0)
 
+    def copy(self) -> "Camera":
+        c = Camera(self.up)
+        c.rotation = self.rotation.copy()
+        c.target = self.target.copy()
+        c.half_height = self.half_height
+        c.width, c.height = self.width, self.height
+        c._lo, c._hi = self._lo.copy(), self._hi.copy()
+        return c
+
     # ── viewport ─────────────────────────────────────────────────────
     def resize(self, width: int, height: int) -> None:
         self.width, self.height = max(1, int(width)), max(1, int(height))

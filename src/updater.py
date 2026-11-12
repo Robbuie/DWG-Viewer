@@ -94,6 +94,37 @@ def installer_asset(release: dict) -> dict | None:
     return None
 
 
+# Outcomes of check(). "failed" is kept apart from "latest" so that a
+# check that never reached GitHub is not reported — or remembered — as
+# "you are up to date".
+UPDATE, LATEST, FAILED = "update", "latest", "failed"
+
+
+def check() -> tuple[str, dict | None]:
+    """(UPDATE, info) | (LATEST, None) | (FAILED, None). Never raises."""
+    release = fetch_latest_release()
+    if not release:
+        return FAILED, None
+    if release.get("draft"):
+        return LATEST, None
+    tag = release.get("tag_name") or ""
+    if not is_newer(tag):
+        return LATEST, None
+    asset = installer_asset(release)
+    if not asset:
+        # Tagged but the installer is not attached yet (the release job
+        # uploads it last). Try again next time rather than give up.
+        return FAILED, None
+    return UPDATE, {
+        "version":    tag.lstrip("vV"),
+        "tag":        tag,
+        "notes":      release.get("body") or "",
+        "url":        asset.get("browser_download_url"),
+        "asset_name": asset.get("name"),
+        "size":       asset.get("size") or 0,
+    }
+
+
 def check_for_update() -> dict | None:
     """
     Return {'version', 'tag', 'notes', 'url', 'asset_name', 'size'} when a

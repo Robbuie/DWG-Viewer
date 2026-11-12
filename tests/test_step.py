@@ -323,6 +323,77 @@ def test_gl_failure_falls_back_to_software():
     v.close()
 
 
+def test_snapshot_transparency_and_xyz_indicator():
+    from src.model_view import ModelView
+    m = step.load(ASM, use_cache=False)
+    v = ModelView()
+    v.resize(400, 300)
+    v.show()
+    v.set_model(m)
+    v.select("Bracket")
+    _pump(0.1)
+    lw, lh = v._view.width(), v._view.height()
+
+    clear = v.snapshot(transparent=True, triad=False)
+    assert (clear.width(), clear.height()) == (lw * 2, lh * 2)   # 2x screen
+    assert clear.pixelColor(2, 2).alpha() == 0                   # background
+    cx, cy, _ = v.camera.project([[50, 30, 30]])[0]              # the bracket
+    mid = clear.pixelColor(int(cx * 2), int(cy * 2))
+    assert mid.alpha() == 255
+    assert mid.blue() > mid.red(), "selection highlight leaked into the snapshot"
+
+    backdrop = v.snapshot(transparent=False, triad=False)
+    assert backdrop.pixelColor(2, 2).alpha() == 255
+
+    # The indicator sits bottom-left; with it off that corner is empty.
+    corner = (int(40 * 2), int((lh - 40) * 2))
+
+    def ink(img):
+        x0, y0 = corner
+        return sum(img.pixelColor(x, y).alpha() > 0
+                   for x in range(x0 - 10, x0 + 60, 2)
+                   for y in range(y0 - 60, y0 + 10, 2))
+    assert ink(clear) == 0
+    assert ink(v.snapshot(transparent=True, triad=True)) > 20
+
+    # Clipboard keeps the alpha: a PNG goes on alongside the bitmap.
+    v.copy_to_clipboard()
+    assert QApplication.clipboard().mimeData().hasFormat("image/png")
+    v.close()
+
+
+def test_jpeg_export_is_flattened_onto_white():
+    from src.main_window import flatten_for_jpeg
+    from src.model_view import ModelView
+    m = step.load(ASM, use_cache=False)
+    v = ModelView()
+    v.resize(300, 200)
+    v.show()
+    v.set_model(m)
+    _pump(0.1)
+    img, flattened = flatten_for_jpeg(v.snapshot(transparent=True))
+    assert flattened and not img.hasAlphaChannel()
+    c = img.pixelColor(2, 2)
+    assert (c.red(), c.green(), c.blue()) == (255, 255, 255)     # not black
+    out = _TMP / "snap.jpg"
+    assert img.save(str(out), "JPG", 92) and out.stat().st_size > 0
+    _, flattened = flatten_for_jpeg(v.snapshot(transparent=False))
+    assert not flattened
+    v.close()
+
+
+def test_snapshot_options_are_remembered():
+    from src import snapshot_prefs
+    t0, a0 = snapshot_prefs.transparent(), snapshot_prefs.triad()
+    try:
+        snapshot_prefs.set_transparent(False)
+        snapshot_prefs.set_triad(True)
+        assert not snapshot_prefs.transparent() and snapshot_prefs.triad()
+    finally:
+        snapshot_prefs.set_transparent(t0)
+        snapshot_prefs.set_triad(a0)
+
+
 def test_software_pick_finds_the_part_under_the_cursor():
     from src.model_view import ModelView, _SoftView
     m = step.load(ASM, use_cache=False)

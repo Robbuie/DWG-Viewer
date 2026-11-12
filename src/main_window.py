@@ -6,8 +6,9 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSize
-from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QColor, QActionGroup
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSize, QSettings
+from PyQt6.QtGui import (QAction, QIcon, QKeySequence, QPixmap, QColor, QActionGroup,
+                         QImage, QPainter)
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QLabel,
     QToolBar, QWidget, QProgressBar, QMessageBox,
@@ -21,7 +22,7 @@ from src.layer_panel import LayerPanel
 from src.converter import DWGConverter, DrawingError
 from src.w2d import Cancelled
 from src.version import __version__, APP_NAME
-from src.update_ui import UpdateChecker
+from src.update_ui import UpdateChecker, RECHECK_MS
 from src import markup as mk
 from src import printing
 from src import recent
@@ -289,9 +290,16 @@ class MainWindow(QMainWindow):
         self._build_markup_toolbar()
         self._build_find_bar()
         self._build_statusbar()
+        self._build_menus()
 
         # Quiet daily check: says nothing unless there is something to say.
         QTimer.singleShot(4000, self._updater.check_silently)
+        # And again while the window stays open, so a release published
+        # mid-week reaches someone who never closes the viewer.
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(RECHECK_MS)
+        self._update_timer.timeout.connect(self._updater.check_silently)
+        self._update_timer.start()
         # Pan is checked by default — sync canvas state
         self._canvas.set_pan_mode(True)
 
@@ -384,6 +392,7 @@ class MainWindow(QMainWindow):
                              "— the arrow saves it as a PDF")
         act_print.setShortcut(QKeySequence("Ctrl+P"))
         act_print.triggered.connect(self._print)
+        self._act_print = act_print
 
         act_pdf = QAction("Save as PDF…", self)
         act_pdf.setToolTip("Save this sheet, or every sheet of a set, as "
@@ -420,6 +429,7 @@ class MainWindow(QMainWindow):
         act_fit.setShortcut(QKeySequence("F"))
         act_fit.triggered.connect(self._fit_view)
         tb.addAction(act_fit)
+        self._act_fit = act_fit
 
         tb.addSeparator()
 
@@ -429,12 +439,14 @@ class MainWindow(QMainWindow):
                             "when the file panel shows this file only")
         act_prev.triggered.connect(lambda: self._navigate_file(-1))
         tb.addAction(act_prev)
+        self._act_prev_file = act_prev
 
         act_next = QAction("▶  Next", self)
         act_next.setToolTip("Next file (Right arrow) — or next sheet "
                             "when the file panel shows this file only")
         act_next.triggered.connect(lambda: self._navigate_file(1))
         tb.addAction(act_next)
+        self._act_next_file = act_next
 
         tb.addSeparator()
 
@@ -467,11 +479,13 @@ class MainWindow(QMainWindow):
         act_copy_view.setShortcut(QKeySequence("Ctrl+Shift+C"))
         act_copy_view.triggered.connect(self._copy_view)
         self.addAction(act_copy_view)
+        self._act_copy_view = act_copy_view
 
         act_save_img = QAction("Save image…", self)
         act_save_img.setShortcut(QKeySequence("Ctrl+Shift+S"))
         act_save_img.triggered.connect(self._save_view_image)
         self.addAction(act_save_img)
+        self._act_save_img = act_save_img
 
         tb.addSeparator()
 
@@ -509,6 +523,7 @@ class MainWindow(QMainWindow):
         act_both.setShortcut(QKeySequence("Ctrl+\\"))
         act_both.triggered.connect(self._toggle_both_panels)
         self.addAction(act_both)
+        self._act_both = act_both
 
         tb.addSeparator()
 
@@ -555,25 +570,222 @@ class MainWindow(QMainWindow):
         tb.addAction(act_render)
         self._act_render = act_render
 
-        # Push the update controls to the right-hand end of the toolbar.
-        spacer = QWidget()
-        spacer.setObjectName("tspacer")
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
+        # Check for Updates, Appearance and About live in the menu bar
+        # (Help and View) now, which keeps this row for the tools.
 
-        act_update = QAction("⭳  Check for Updates", self)
-        act_update.setToolTip("Check GitHub for a newer version")
-        act_update.triggered.connect(self._check_updates)
-        tb.addAction(act_update)
+    # ------------------------------------------------------------------ #
+    #  Menu bar
+    # ------------------------------------------------------------------ #
 
-        act_theme = QAction("\u25d1  Appearance", self)
-        act_theme.setToolTip("Theme, accent colour and chrome density")
-        act_theme.triggered.connect(self._appearance)
-        tb.addAction(act_theme)
+    @staticmethod
+    def _menu_text(act: QAction, text: str) -> QAction:
+        """Give an action a plain menu label while its toolbar button keeps
+        the glyph it has always shown.
 
-        act_about = QAction("About", self)
-        act_about.triggered.connect(self._about)
-        tb.addAction(act_about)
+        One QAction serves both, so there is one shortcut and one
+        enabled/checked state; toolbar buttons draw iconText(), menus
+        draw text().
+        """
+        act.setIconText(act.text())
+        act.setText(text)
+        return act
+
+    @staticmethod
+    def _hint(text: str, parent, slot=None, checkable=False) -> QAction:
+        """A menu-only action whose key is handled elsewhere (the canvas,
+        the 3D view). The key goes after a tab so the menu shows it
+        without registering a second, ambiguous shortcut."""
+        act = QAction(text, parent)
+        act.setCheckable(checkable)
+        if slot is not None:
+            act.triggered.connect(slot)
+        return act
+
+    def _build_menus(self) -> None:
+        mb = self.menuBar()
+        mt = self._menu_text
+
+        self._act_update = QAction("Check for Updates…", self)
+        self._act_update.triggered.connect(self._check_updates)
+        self._act_theme = QAction("Appearance…", self)
+        self._act_theme.triggered.connect(self._appearance)
+        self._act_about = QAction(f"About {APP_NAME}", self)
+        self._act_about.triggered.connect(self._about)
+
+        # File
+        m = mb.addMenu("&File")
+        m.addAction(mt(self._act_open, "&Open Folder…"))
+        self._recent_menu.setTitle("Open &Recent")
+        m.addMenu(self._recent_menu)
+        m.addSeparator()
+        m.addAction(mt(self._act_prev_file, "Pre&vious File\t\u2190"))
+        m.addAction(mt(self._act_next_file, "Ne&xt File\t\u2192"))
+        m.addSeparator()
+        m.addAction(mt(self._act_print, "&Print…"))
+        m.addAction(mt(self._act_pdf, "Save as P&DF…"))
+        m.addAction(mt(self._act_save_img, "Save &Image…"))
+        m.addSeparator()
+        act_exit = QAction("E&xit", self)
+        act_exit.setShortcut(QKeySequence("Ctrl+Q"))
+        act_exit.triggered.connect(self.close)
+        m.addAction(act_exit)
+        self._menu_file = m
+
+        # Edit
+        m = mb.addMenu("&Edit")
+        m.addAction(mt(self._act_mk_undo, "&Undo Markup"))
+        m.addAction(mt(self._act_mk_delete, "&Delete Markup\tDel"))
+        m.addAction(mt(self._act_mk_clear, "C&lear Markup on Sheet…"))
+        m.addSeparator()
+        m.addAction(mt(self._act_copy_view, "&Copy View"))
+        m.addAction(mt(self._act_snap, "&Snapshot Region"))
+        m.addSeparator()
+        m.addAction(mt(self._act_find, "&Find…"))
+        m.addAction(mt(self._act_find_next, "Find &Next"))
+        self._menu_edit = m
+
+        # View
+        m = mb.addMenu("&View")
+        m.addAction(mt(self._act_fit, "&Fit to Window"))
+        m.addSeparator()
+        m.addAction(mt(self._act_nav, "&Navigator"))
+        m.addAction(mt(self._act_files, "File &Browser"))
+        m.addAction(mt(self._act_layers_panel, "&Layers Panel"))
+        m.addAction(mt(self._act_markup_bar, "&Markup Toolbar"))
+        m.addAction(mt(self._act_both, "Hide/Show &Side Panels"))
+        m.addSeparator()
+        m.addAction(mt(self._act_prev_sheet, "Previous S&heet"))
+        m.addAction(mt(self._act_next_sheet, "Next Sh&eet"))
+        m.addSeparator()
+        self._menu_3d = self._build_3d_menu(m)
+        m.addSeparator()
+        m.addAction(mt(self._act_theme, "&Appearance…"))
+        self._menu_view = m
+
+        # Tools
+        m = mb.addMenu("&Tools")
+        m.addAction(mt(self._act_pan, "&Pan"))
+        m.addAction(mt(self._act_measure, "&Measure"))
+        m.addSeparator()
+        mk_menu = m.addMenu("Mar&kup")
+        for tool, _glyph, name, _tip, _key in self._MARKUP_TOOLS:
+            mk_menu.addAction(mt(self._markup_actions[tool], name))
+        mk_menu.addSeparator()
+        mk_menu.addAction(mt(self._act_mk_show, "&Show Markup"))
+        self._menu_markup = mk_menu
+        m.addSeparator()
+        m.addAction(mt(self._act_render, "&Apply Layers"))
+        self._menu_tools = m
+
+        # Help
+        m = mb.addMenu("&Help")
+        act_keys = QAction("&Keyboard Shortcuts", self)
+        act_keys.setShortcut(QKeySequence("F1"))
+        act_keys.triggered.connect(self._show_shortcuts)
+        m.addAction(act_keys)
+        m.addSeparator()
+        m.addAction(mt(self._act_update, "Check for &Updates…"))
+        m.addSeparator()
+        m.addAction(mt(self._act_about, f"&About {APP_NAME}"))
+        self._menu_help = m
+
+        self._menu_3d.setEnabled(False)
+
+    def _build_3d_menu(self, parent_menu: QMenu) -> QMenu:
+        """View ▸ 3D Model. Mirrors the strip above the 3D view; the keys
+        belong to that view, so they are shown here as hints."""
+        m = parent_menu.addMenu("&3D Model")
+        names = (("iso", "&Iso", "0"), ("front", "&Front", "1"),
+                 ("back", "&Back", "2"), ("right", "&Right", "3"),
+                 ("left", "&Left", "4"), ("top", "&Top", "5"),
+                 ("bottom", "B&ottom", "6"))
+        for view, text, key in names:
+            m.addAction(self._hint(f"{text}\t{key}", self,
+                                   lambda _=False, v=view: self._model_view
+                                   and self._model_view.set_view(v)))
+        m.addSeparator()
+        self._act_3d_edges = self._hint(
+            "Show &Edges\tE", self,
+            lambda on: self._model_view and self._model_view.set_edges(on),
+            checkable=True)
+        m.addAction(self._act_3d_edges)
+        m.addSeparator()
+        from src import snapshot_prefs as _snap
+        self._act_3d_snap_clear = self._hint(
+            "Snapshots: &Transparent Background", self,
+            _snap.set_transparent, checkable=True)
+        self._act_3d_snap_triad = self._hint(
+            "Snapshots: Include &XYZ Indicator", self,
+            _snap.set_triad, checkable=True)
+        m.addAction(self._act_3d_snap_clear)
+        m.addAction(self._act_3d_snap_triad)
+        m.addSeparator()
+        up = m.addMenu("&Up Axis")
+        group = QActionGroup(self)
+        self._act_3d_up = {}
+        for axis, text in (("z", "&Z up (Creo, NX, CATIA)"),
+                           ("y", "&Y up (SolidWorks, Inventor, Fusion)")):
+            a = self._hint(text, self,
+                           lambda _=False, ax=axis: self._model_view
+                           and self._model_view.set_up_axis(ax),
+                           checkable=True)
+            group.addAction(a)
+            up.addAction(a)
+            self._act_3d_up[axis] = a
+
+        def sync():
+            for act, on in ((self._act_3d_snap_clear, _snap.transparent()),
+                            (self._act_3d_snap_triad, _snap.triad())):
+                act.blockSignals(True)
+                act.setChecked(on)
+                act.blockSignals(False)
+            mv = self._model_view
+            if mv is None:
+                return
+            self._act_3d_edges.blockSignals(True)
+            self._act_3d_edges.setChecked(mv.show_edges)
+            self._act_3d_edges.blockSignals(False)
+            self._act_3d_up[mv.camera.up].setChecked(True)
+        m.aboutToShow.connect(sync)
+        return m
+
+    def _shortcut_rows(self) -> list[tuple[str, str, str]]:
+        """(menu, item, key) for every menu entry that has a key, read off
+        the menus themselves so the list cannot drift from them."""
+        rows = []
+
+        def walk(menu, path):
+            for act in menu.actions():
+                if act.isSeparator():
+                    continue
+                sub = act.menu()
+                if sub is not None and sub is not self._recent_menu:
+                    walk(sub, f"{path} ▸ {sub.title().replace('&', '')}")
+                    continue
+                label, _, hint = act.text().partition("\t")
+                key = act.shortcut().toString(
+                    QKeySequence.SequenceFormat.NativeText) or hint
+                if key:
+                    rows.append((path, label.replace("&", "").rstrip("…"), key))
+        for top in (self._menu_file, self._menu_edit, self._menu_view,
+                    self._menu_tools, self._menu_help):
+            walk(top, top.title().replace("&", ""))
+        return rows
+
+    def _show_shortcuts(self) -> None:
+        rows = "".join(
+            f"<tr><td style='color:gray;padding-right:14px'>{m}</td>"
+            f"<td style='padding-right:14px'>{label}</td><td><b>{key}</b></td></tr>"
+            for m, label, key in self._shortcut_rows())
+        mouse = ("<p><b>Mouse</b> — sheets: wheel zooms, middle-drag or "
+                 "Alt+drag pans. 3D models: drag rotates, middle-drag or "
+                 "Shift+drag pans, wheel zooms, click selects a part, "
+                 "double-click fits.</p>")
+        box = QMessageBox(self)
+        box.setWindowTitle("Keyboard Shortcuts")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(f"<table cellspacing=2>{rows}</table>{mouse}")
+        box.exec()
 
     # ------------------------------------------------------------------ #
     #  Find bar
@@ -641,6 +853,7 @@ class MainWindow(QMainWindow):
         act_next_key.setShortcut(QKeySequence("F3"))
         act_next_key.triggered.connect(lambda: self._find_step(True))
         self.addAction(act_next_key)
+        self._act_find_next = act_next_key
 
     def _show_find(self) -> None:
         self._find_bar.show()
@@ -779,6 +992,7 @@ class MainWindow(QMainWindow):
         act_clear.setToolTip("Remove every markup on this sheet")
         act_clear.triggered.connect(self._clear_markup)
         tb.addAction(act_clear)
+        self._act_mk_clear = act_clear
 
         tb.addSeparator()
 
@@ -801,9 +1015,11 @@ class MainWindow(QMainWindow):
 
         act_bar = QAction("Show/hide the markup toolbar", self)
         act_bar.setShortcut(QKeySequence("Ctrl+3"))
-        act_bar.triggered.connect(
-            lambda: self._markup_bar.setVisible(not self._markup_bar.isVisible()))
+        act_bar.setCheckable(True)
+        act_bar.setChecked(True)
+        act_bar.toggled.connect(self._markup_bar.setVisible)
         self.addAction(act_bar)
+        self._act_markup_bar = act_bar
 
         self._sync_markup_actions()
 
@@ -930,9 +1146,16 @@ class MainWindow(QMainWindow):
 
     def _on_snapshot_taken(self, w: int, h: int) -> None:
         self._act_snap.setChecked(False)
+        extra = ""
+        if self._model is not None:
+            from src import snapshot_prefs
+            bits = ["transparent background" if snapshot_prefs.transparent()
+                    else "with backdrop",
+                    "XYZ indicator" if snapshot_prefs.triad()
+                    else "no XYZ indicator"]
+            extra = f" ({', '.join(bits)} — change under View \u25b8 3D Model)"
         self.statusBar().showMessage(
-            f"Copied to the clipboard at {w} \u00d7 {h} px — paste it anywhere.",
-            5000)
+            f"Copied to the clipboard at {w} \u00d7 {h} px{extra}.", 6000)
 
     def _save_view_image(self) -> None:
         if self._model is not None:
@@ -942,21 +1165,39 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Open a drawing first.", 3000)
             return
-        default = f"{source.stem}.png"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save image", default, "PNG image (*.png)")
+        png_filter = "PNG image (*.png)"
+        jpg_filter = "JPEG image (*.jpg *.jpeg)"
+        last = QSettings().value("export/imageFormat", "png")
+        default = f"{source.stem}.{'jpg' if last == 'jpg' else 'png'}"
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Save image", default, f"{png_filter};;{jpg_filter}",
+            jpg_filter if last == "jpg" else png_filter)
         if not path:
             return
+        ext = Path(path).suffix.lower()
+        if ext not in (".png", ".jpg", ".jpeg"):
+            ext = ".jpg" if chosen == jpg_filter else ".png"
+            path += ext
+        is_jpg = ext in (".jpg", ".jpeg")
+        QSettings().setValue("export/imageFormat", "jpg" if is_jpg else "png")
         if self._model is not None:
-            image = self._model_view.grab_image()
+            image = self._model_view.snapshot()
         else:
             visible = self._canvas.mapToScene(
                 self._canvas.viewport().rect()).boundingRect()
             image = self._canvas.render_region(visible)
-        if image is None or not image.save(path, "PNG"):
+        note = ""
+        if image is not None and is_jpg:
+            image, flattened = flatten_for_jpeg(image)
+            if flattened:
+                note = " (JPEG has no transparency, so the background is white — " \
+                       "save as PNG to keep it transparent)"
+        ok = image is not None and image.save(path, "JPG" if is_jpg else "PNG",
+                                               92 if is_jpg else -1)
+        if not ok:
             self.statusBar().showMessage("Could not write that image.", 4000)
         else:
-            self.statusBar().showMessage(f"Saved {path}", 5000)
+            self.statusBar().showMessage(f"Saved {path}{note}", 8000)
 
     # ------------------------------------------------------------------ #
     #  Updates
@@ -973,10 +1214,10 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "DWG, DXF, DWF and DWFx drawing viewer.<br>"
+            "DWG, DXF, DWF and DWFx drawing viewer, and STEP 3D models.<br>"
             "DWG/DXF are rendered with ezdxf and DWG conversion uses the "
             "free ODA File Converter; DWFx sheets are read directly from "
-            "their XPS package.")
+            "their XPS package; STEP models are read with OpenCascade.")
 
     def _build_statusbar(self):
         sb = QStatusBar()
@@ -1244,6 +1485,8 @@ class MainWindow(QMainWindow):
             mv.partSelected.connect(self._on_part_selected)
             mv.statusMessage.connect(
                 lambda msg: self.statusBar().showMessage(msg, 6000))
+            mv.snapshotTaken.connect(self._on_snapshot_taken)
+            mv.saveImageRequested.connect(self._save_view_image)
             self._center.addWidget(mv)
             self._model_view = mv
         return self._model_view
@@ -1263,10 +1506,12 @@ class MainWindow(QMainWindow):
         sheet_only = not on
         for widget in (self._print_btn,):
             widget.setEnabled(sheet_only)
-        for act in (self._act_pdf, self._act_find, self._act_pan,
+        for act in (self._act_print, self._act_pdf, self._act_find,
+                    self._act_find_next, self._act_pan,
                     self._act_measure, self._act_nav, self._act_render,
                     *self._markup_bar.actions()):
             act.setEnabled(sheet_only)
+        self._menu_3d.setEnabled(on)
         if on:
             self._hide_find()
             self._measure_label.setText("")
@@ -1736,6 +1981,26 @@ class MainWindow(QMainWindow):
 # ------------------------------------------------------------------ #
 #  Helpers
 # ------------------------------------------------------------------ #
+
+def flatten_for_jpeg(image: QImage) -> tuple[QImage, bool]:
+    """JPEG cannot store transparency; written as-is, transparent pixels
+    come out black. Composite onto white instead. Returns the image and
+    whether anything was actually transparent."""
+    if not image.hasAlphaChannel():
+        return image, False
+    out = QImage(image.size(), QImage.Format.Format_RGB32)
+    out.setDevicePixelRatio(image.devicePixelRatio())
+    out.fill(QColor("white"))
+    p = QPainter(out)
+    p.drawImage(0, 0, image)
+    p.end()
+    probe = image.convertToFormat(QImage.Format.Format_ARGB32)
+    w, h = probe.width(), probe.height()
+    step = max(1, min(w, h) // 64)
+    transparent = any(probe.pixelColor(x, y).alpha() < 255
+                      for x in range(0, w, step) for y in range(0, h, step))
+    return out, transparent
+
 
 def _vline() -> QWidget:
     line = QWidget()
